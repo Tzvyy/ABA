@@ -1,6 +1,12 @@
-local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
-local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
-local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+local repo = "https://raw.githubusercontent.com/Tzvyy/JopLib/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local Elements = loadstring(game:HttpGet(repo .. "Elements.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "SaveManager.lua"))()
+
+Elements:Setup(Library)
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
 
 -- Services & Locals
 local Players = game:GetService("Players")
@@ -18,22 +24,25 @@ local min, max, floor, clamp, huge, pow, fmt = math.min, math.max, math.floor, m
 local insert = table.insert
 local SIGNS = {V3(-1,-1,-1),V3(-1,-1,1),V3(-1,1,-1),V3(-1,1,1),V3(1,-1,-1),V3(1,-1,1),V3(1,1,-1),V3(1,1,1)}
 
+-- Proxy tables
+local Toggles = Library.Toggles
+local Options = Library.Options
+
 -- Window
-local Window = Fluent:CreateWindow({
-    Title = "ABA Helper", SubTitle = "by josepi",
-    TabWidth = 160, Size = UDim2.fromOffset(580, 460),
-    Acrylic = true, Theme = "Dark", MinimizeKey = Enum.KeyCode.LeftControl
+local Window = Library:CreateWindow({
+    Title = "ABA Helper | by josepi",
+    Center = true,
+    AutoShow = true,
+    TabPadding = 8,
 })
 
 local Tabs = {
-    Tween   = Window:AddTab({ Title = "Tween",    Icon = "target" }),
-    Rage    = Window:AddTab({ Title = "Rage",      Icon = "swords" }),
-    AutoQTE = Window:AddTab({ Title = "Auto QTE",  Icon = "activity" }),
-    Esp     = Window:AddTab({ Title = "Esp",       Icon = "eye" }),
-    Settings= Window:AddTab({ Title = "Settings",  Icon = "settings" })
+    Tween      = Window:AddTab("Tween"),
+    Rage       = Window:AddTab("Rage"),
+    AutoQTE    = Window:AddTab("Auto QTE"),
+    Esp        = Window:AddTab("Esp"),
+    ["GUI Settings"] = Window:AddTab("GUI Settings"),
 }
-
-local Options = Fluent.Options
 
 -- State
 local status_nanami, status_camera, status_kokushibo = false, false, false
@@ -44,6 +53,7 @@ local status_esp_hpbar = false
 local status_esp_modebar = false
 local status_esp_modepct = false
 local cam_lock_enabled, camera_lock_timing = false, false
+local tween_enabled = false
 local Target, CamLockTarget, TweenConnection = nil, nil, nil
 
 -- FOV Circles
@@ -295,14 +305,14 @@ end)
 local function startTweenLoop()
     if TweenConnection then TweenConnection:Disconnect() end
     TweenConnection = RunService.Heartbeat:Connect(function(dt)
-        if not Options.TweenKey.Value then return end
+        if not tween_enabled then return end
         local char = LP.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
         if Target then
             local hum = Target:FindFirstChildOfClass("Humanoid")
             if not Target.Parent or (hum and hum.Health <= 0) then
-                Target = nil; Options.TweenKey:SetValue(false); return
+                Target = nil; Toggles.TweenTgl:SetValue(false); return
             end
         else
             Target = findClosestTarget(Options.FOVRadius and Options.FOVRadius.Value or 150, Options.TweenRange and Options.TweenRange.Value or 500)
@@ -319,61 +329,192 @@ local function startTweenLoop()
 end
 
 -- ============================================================================
---                           INTERFACE (FLUENT)
+--                           INTERFACE (JOPLIB)
 -- ============================================================================
 
--- RAGE
-Tabs.Rage:AddKeybind("CamLockBind", {Title = "Camera Lock Keybind", Mode = "Toggle", Default = "", Callback = function(v)
-    cam_lock_enabled = v
-    UIS.MouseDeltaSensitivity = v and 0 or 1
-end})
-Tabs.Rage:AddToggle("ShowCamLockFov", {Title = "Show Fov", Default = false})
-Tabs.Rage:AddSlider("CamLockFovSize", {Title = "Fov Size", Min = 50, Max = 800, Default = 150, Rounding = 0})
-Tabs.Rage:AddSlider("CamLockRange", {Title = "Range", Min = 10, Max = 500, Default = 250, Rounding = 0})
-Tabs.Rage:AddSlider("CamLockSmoothness", {Title = "Smoothness", Min = 0, Max = 100, Default = 25, Rounding = 0})
+-- TWEEN TAB
+local TweenGroup = Tabs.Tween:AddLeftGroupbox("Tween")
 
--- TWEEN
-Tabs.Tween:AddKeybind("TweenKey", {Title = "Toggle Tween", Mode = "Toggle", Default = "", Callback = function(v)
-    if v then Target = findClosestTarget(Options.FOVRadius and Options.FOVRadius.Value or 150, Options.TweenRange and Options.TweenRange.Value or 500); startTweenLoop()
-    else if TweenConnection then TweenConnection:Disconnect() end; Target = nil end
-end})
-Tabs.Tween:AddToggle("ShowFOV", {Title = "Show Fov", Default = false})
-Tabs.Tween:AddSlider("FOVRadius", {Title = "Fov Size", Min = 50, Max = 500, Default = 150, Rounding = 0})
-Tabs.Tween:AddSlider("TweenRange", {Title = "Range", Min = 10, Max = 500, Default = 250, Rounding = 0})
-Tabs.Tween:AddSlider("Speed", {Title = "Speed", Min = 5, Max = 200, Default = 60, Rounding = 0})
-Tabs.Tween:AddSlider("Height", {Title = "Height", Min = -5, Max = 10, Default = 3.5, Rounding = 1})
-Tabs.Tween:AddSlider("Offset", {Title = "Offset", Min = -5, Max = 5, Default = 0.2, Rounding = 1})
+TweenGroup:AddToggle("TweenTgl", {
+    Text = "Toggle Tween",
+    Default = false,
+}):AddKeyPicker("TweenKey", {
+    Default = "None",
+    SyncToggleState = true,
+    Mode = "Toggle",
+    Text = "Toggle Tween",
+})
 
--- AUTO QTEs
-Tabs.AutoQTE:AddToggle("Nanami_Tgl", {Title = "Auto Nanami", Default = false}):OnChanged(function(v) status_nanami = v end)
-Tabs.AutoQTE:AddToggle("Koku_Tgl", {Title = "Auto Kokushibo", Default = false}):OnChanged(function(v) status_kokushibo = v end)
-Tabs.AutoQTE:AddToggle("Camera_Tgl", {Title = "Auto Camera Timing", Default = false}):OnChanged(function(v) status_camera = v end)
+TweenGroup:AddToggle("ShowFOV", {
+    Text = "Show Fov",
+    Default = false,
+})
 
--- ESP
-Tabs.Esp:AddToggle("EspMasterTgl", {Title = "Enable ESP", Default = false}):OnChanged(function(v)
-    status_esp = v
-    if not v then for _,d in pairs(espCache) do hideEsp(d) end end
+TweenGroup:AddSlider("FOVRadius", {
+    Text = "Fov Size",
+    Default = 150,
+    Min = 50,
+    Max = 500,
+    Rounding = 0,
+})
+
+TweenGroup:AddSlider("TweenRange", {
+    Text = "Range",
+    Default = 250,
+    Min = 10,
+    Max = 500,
+    Rounding = 0,
+})
+
+TweenGroup:AddSlider("Speed", {
+    Text = "Speed",
+    Default = 60,
+    Min = 5,
+    Max = 200,
+    Rounding = 0,
+})
+
+TweenGroup:AddSlider("Height", {
+    Text = "Height",
+    Default = 3.5,
+    Min = -5,
+    Max = 10,
+    Rounding = 1,
+})
+
+TweenGroup:AddSlider("Offset", {
+    Text = "Offset",
+    Default = 0.2,
+    Min = -5,
+    Max = 5,
+    Rounding = 1,
+})
+
+Toggles.TweenTgl:OnChanged(function()
+    tween_enabled = Toggles.TweenTgl.Value
+    if tween_enabled then
+        Target = findClosestTarget(Options.FOVRadius and Options.FOVRadius.Value or 150, Options.TweenRange and Options.TweenRange.Value or 500)
+        startTweenLoop()
+    else
+        if TweenConnection then TweenConnection:Disconnect() end
+        Target = nil
+    end
 end)
-Tabs.Esp:AddToggle("EspBoxTgl", {Title = "Box", Default = false}):OnChanged(function(v)
-    status_esp_box = v
-    if not v then for _,d in pairs(espCache) do d.box.Visible = false end end
+
+-- RAGE TAB
+local RageGroup = Tabs.Rage:AddLeftGroupbox("Camera Lock")
+
+RageGroup:AddToggle("CamLockTgl", {
+    Text = "Camera Lock",
+    Default = false,
+}):AddKeyPicker("CamLockBind", {
+    Default = "None",
+    SyncToggleState = true,
+    Mode = "Toggle",
+    Text = "Camera Lock",
+})
+
+RageGroup:AddToggle("ShowCamLockFov", {
+    Text = "Show Fov",
+    Default = false,
+})
+
+RageGroup:AddSlider("CamLockFovSize", {
+    Text = "Fov Size",
+    Default = 150,
+    Min = 50,
+    Max = 800,
+    Rounding = 0,
+})
+
+RageGroup:AddSlider("CamLockRange", {
+    Text = "Range",
+    Default = 250,
+    Min = 10,
+    Max = 500,
+    Rounding = 0,
+})
+
+RageGroup:AddSlider("CamLockSmoothness", {
+    Text = "Smoothness",
+    Default = 25,
+    Min = 0,
+    Max = 100,
+    Rounding = 0,
+})
+
+Toggles.CamLockTgl:OnChanged(function()
+    cam_lock_enabled = Toggles.CamLockTgl.Value
+    UIS.MouseDeltaSensitivity = cam_lock_enabled and 0 or 1
 end)
-Tabs.Esp:AddToggle("EspNameTgl", {Title = "Name", Default = false}):OnChanged(function(v)
-    status_esp_name = v
-    if not v then for _,d in pairs(espCache) do d.name.Visible = false end end
+
+-- AUTO QTE TAB
+local QTEGroup = Tabs.AutoQTE:AddLeftGroupbox("Auto QTE")
+
+QTEGroup:AddToggle("Nanami_Tgl", {
+    Text = "Auto Nanami",
+    Default = false,
+})
+
+QTEGroup:AddToggle("Koku_Tgl", {
+    Text = "Auto Kokushibo",
+    Default = false,
+})
+
+QTEGroup:AddToggle("Camera_Tgl", {
+    Text = "Auto Camera Timing",
+    Default = false,
+})
+
+Toggles.Nanami_Tgl:OnChanged(function() status_nanami = Toggles.Nanami_Tgl.Value end)
+Toggles.Koku_Tgl:OnChanged(function() status_kokushibo = Toggles.Koku_Tgl.Value end)
+Toggles.Camera_Tgl:OnChanged(function() status_camera = Toggles.Camera_Tgl.Value end)
+
+-- ESP TAB
+local EspGroup = Tabs.Esp:AddLeftGroupbox("ESP")
+
+EspGroup:AddToggle("EspMasterTgl", {
+    Text = "Enable ESP",
+    Default = false,
+})
+
+EspGroup:AddDropdown("EspElements", {
+    Text = "ESP Elements",
+    Values = { "Box", "Name", "HP Bar", "Mode Bar", "Mode %" },
+    Default = {},
+    Multi = true,
+})
+
+Toggles.EspMasterTgl:OnChanged(function()
+    status_esp = Toggles.EspMasterTgl.Value
+    if not status_esp then for _,d in pairs(espCache) do hideEsp(d) end end
 end)
-Tabs.Esp:AddToggle("EspHpTgl", {Title = "HP Bar", Default = false}):OnChanged(function(v)
-    status_esp_hpbar = v
-    if not v then for _,d in pairs(espCache) do hideBar(d.hp) end end
+
+local function updateEspFlags()
+    local sel = Options.EspElements.Value
+    local newBox = sel["Box"] or false
+    local newName = sel["Name"] or false
+    local newHp = sel["HP Bar"] or false
+    local newMode = sel["Mode Bar"] or false
+    local newPct = sel["Mode %"] or false
+
+    if status_esp_box and not newBox then for _,d in pairs(espCache) do d.box.Visible = false end end
+    if status_esp_name and not newName then for _,d in pairs(espCache) do d.name.Visible = false end end
+    if status_esp_hpbar and not newHp then for _,d in pairs(espCache) do hideBar(d.hp) end end
+    if status_esp_modebar and not newMode then for _,d in pairs(espCache) do hideBar(d.mode) end end
+    if status_esp_modepct and not newPct then for _,d in pairs(espCache) do d.pct.Visible = false end end
+
+    status_esp_box = newBox
+    status_esp_name = newName
+    status_esp_hpbar = newHp
+    status_esp_modebar = newMode
+    status_esp_modepct = newPct
+end
+
+Options.EspElements:OnChanged(function()
+    updateEspFlags()
 end)
-Tabs.Esp:AddToggle("EspModeTgl", {Title = "Mode Bar", Default = false}):OnChanged(function(v)
-    status_esp_modebar = v
-    if not v then for _,d in pairs(espCache) do hideBar(d.mode) end end
-end)
-Tabs.Esp:AddToggle("EspModePctTgl", {Title = "Mode %", Default = false}):OnChanged(function(v)
-    status_esp_modepct = v
-    if not v then for _,d in pairs(espCache) do d.pct.Visible = false end end
-end)
+
 
 -- ============================================================================
 --                          MAIN RENDER LOOP
@@ -388,16 +529,13 @@ RunService.RenderStepped:Connect(function()
     local vpCenter = V2(vp.X * 0.5, vp.Y * 0.5)
 
     -- FOV circles
-    if Options.ShowFOV then
-        FOVCircle.Visible = Options.ShowFOV.Value
-        FOVCircle.Radius = Options.FOVRadius.Value
-        FOVCircle.Position = vpCenter
-    end
-    if Options.ShowCamLockFov then
-        CamLockFOVCircle.Visible = Options.ShowCamLockFov.Value
-        CamLockFOVCircle.Radius = Options.CamLockFovSize.Value
-        CamLockFOVCircle.Position = vpCenter
-    end
+    FOVCircle.Visible = Toggles.ShowFOV.Value
+    FOVCircle.Radius = Options.FOVRadius.Value
+    FOVCircle.Position = vpCenter
+
+    CamLockFOVCircle.Visible = Toggles.ShowCamLockFov.Value
+    CamLockFOVCircle.Radius = Options.CamLockFovSize.Value
+    CamLockFOVCircle.Position = vpCenter
 
     -- Camera lock
     if cam_lock_enabled then
@@ -480,9 +618,42 @@ RunService.RenderStepped:Connect(function()
     end
 end)
 
-SaveManager:SetLibrary(Fluent)
-InterfaceManager:SetLibrary(Fluent)
-InterfaceManager:BuildInterfaceSection(Tabs.Settings)
-SaveManager:BuildConfigSection(Tabs.Settings)
-Window:SelectTab(1)
+-- ============================================================================
+--                           GUI SETTINGS TAB
+-- ============================================================================
+
+local MenuGroup = Tabs["GUI Settings"]:AddLeftGroupbox("Menu")
+
+MenuGroup:AddButton({
+    Text = "Unload",
+    Func = function() Library:Unload() end,
+})
+
+MenuGroup:AddLabel(""):AddKeyPicker("MenuKeybind", {
+    Default = "End",
+    NoUI = true,
+    Text = "Menu keybind",
+})
+
+Library.ToggleKeybind = Options.MenuKeybind
+
+-- ============================================================================
+--                         SAVE / THEME / UNLOAD
+-- ============================================================================
+
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+
+SaveManager:BuildConfigSection(Tabs["GUI Settings"])
+ThemeManager:ApplyToTab(Tabs["GUI Settings"], MenuGroup)
+
+Library:OnUnload(function()
+    if TweenConnection then TweenConnection:Disconnect() end
+    FOVCircle:Remove()
+    CamLockFOVCircle:Remove()
+    for k in pairs(espCache) do cleanEsp(k) end
+    Library.Unloaded = true
+end)
+
 SaveManager:LoadAutoloadConfig()
+ThemeManager:LoadAutoloadTheme()
