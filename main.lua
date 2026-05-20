@@ -596,18 +596,69 @@
         Default = 8, Min = 4, Max = 16, Rounding = 0, Increment = 1, Suffix = " studs/s",
     })
 
-    local function nostunInCombo(char)
-        if not char then return false end
-        for name in pairs(NOSTUN_FOLDERS) do
-            if char:FindFirstChild(name) then return true end
+    -- Event-driven combo flag. Updated by ChildAdded/Removed on Character and
+    -- TagSystem2 TagAdded/Removed on the same. Avoids polling-window misses.
+    local nostun_inCombo   = false
+    local nostun_folderCnt = 0
+    local nostun_tagCnt    = 0
+    local function nostunRecompute() nostun_inCombo = (nostun_folderCnt + nostun_tagCnt) > 0 end
+
+    local nostun_listeners = {}  -- list of disconnect callbacks
+    local function nostunUnbindChar()
+        for _, d in ipairs(nostun_listeners) do pcall(d) end
+        table.clear(nostun_listeners)
+        nostun_folderCnt, nostun_tagCnt = 0, 0
+        nostunRecompute()
+    end
+
+    local function nostunBindChar(char)
+        nostunUnbindChar()
+        if not char then return end
+        -- Initial folder scan.
+        for _, c in ipairs(char:GetChildren()) do
+            if NOSTUN_FOLDERS[c.Name] then nostun_folderCnt = nostun_folderCnt + 1 end
         end
+        local addConn = char.ChildAdded:Connect(function(c)
+            if NOSTUN_FOLDERS[c.Name] then
+                nostun_folderCnt = nostun_folderCnt + 1
+                nostunRecompute()
+            end
+        end)
+        local remConn = char.ChildRemoved:Connect(function(c)
+            if NOSTUN_FOLDERS[c.Name] then
+                nostun_folderCnt = math.max(0, nostun_folderCnt - 1)
+                nostunRecompute()
+            end
+        end)
+        table.insert(nostun_listeners, function() addConn:Disconnect() end)
+        table.insert(nostun_listeners, function() remConn:Disconnect() end)
+        -- TagSystem2.
         if TagSystem2 then
             for name in pairs(NOSTUN_TAGS) do
-                if TagSystem2:HasTag(char, name) then return true end
+                if TagSystem2:HasTag(char, name) then nostun_tagCnt = nostun_tagCnt + 1 end
             end
+            local tagAdd = TagSystem2.TagAdded(char, function(tag)
+                if NOSTUN_TAGS[tag.Name] then
+                    nostun_tagCnt = nostun_tagCnt + 1
+                    nostunRecompute()
+                end
+            end)
+            local tagRem = TagSystem2.TagRemoved(char, function(tag)
+                if NOSTUN_TAGS[tag.Name] then
+                    nostun_tagCnt = math.max(0, nostun_tagCnt - 1)
+                    nostunRecompute()
+                end
+            end)
+            table.insert(nostun_listeners, function()
+                pcall(function() TagSystem2.AddedDisconnect(tagAdd) end)
+                pcall(function() TagSystem2.AddedDisconnect(tagRem) end)
+            end)
         end
-        return false
+        nostunRecompute()
     end
+
+    nostunBindChar(LP.Character)
+    LP.CharacterAdded:Connect(nostunBindChar)
 
     -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender hook that
     -- writes WalkSpeed = 0/5 during combo. Otherwise our write gets clobbered
@@ -620,23 +671,23 @@
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         if not (char and hum and hum.Health > 0) then return end
-        local inCombo = nostunInCombo(char)
-        if inCombo then
+        if nostun_inCombo then
             hum.WalkSpeed = nostun_walkout
             if hum.JumpPower < 35 then hum.JumpPower = 35 end
         end
-        if nostun_debug and tick() - nostun_lastPrint > 0.3 then
+        if nostun_debug and tick() - nostun_lastPrint > 0.1 then
             nostun_lastPrint = tick()
             local movers = {}
             if hrp then
                 for _, c in ipairs(hrp:GetChildren()) do
                     if c:IsA("BodyMover") or c:IsA("Constraint") or c:IsA("VectorForce") or c:IsA("LinearVelocity") or c:IsA("AlignPosition") or c:IsA("BodyVelocity") or c:IsA("BodyPosition") then
-                        movers[#movers+1] = c.ClassName .. ":" .. c.Name
+                        movers[#movers+1] = c.ClassName .. ":" .. c.Name .. " v=" .. tostring(c:IsA("BodyVelocity") and c.Velocity or "")
                     end
                 end
             end
-            print(string.format("[NS] inCombo=%s WS=%.1f JP=%.1f PS=%s movers=[%s]",
-                tostring(inCombo), hum.WalkSpeed, hum.JumpPower,
+            print(string.format("[NS] inCombo=%s (f=%d t=%d) WS=%.1f JP=%.1f PS=%s movers=[%s]",
+                tostring(nostun_inCombo), nostun_folderCnt, nostun_tagCnt,
+                hum.WalkSpeed, hum.JumpPower,
                 tostring(hum.PlatformStand), table.concat(movers, ",")))
         end
     end)
