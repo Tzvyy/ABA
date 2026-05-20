@@ -1,4 +1,4 @@
-    local repo = "https://raw.githubusercontent.com/Tzvyy/JopLib/main/"
+﻿    local repo = "https://raw.githubusercontent.com/Tzvyy/JopLib/main/"
     local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
     local Elements = loadstring(game:HttpGet(repo .. "Elements.lua"))()
     local ThemeManager = loadstring(game:HttpGet(repo .. "ThemeManager.lua"))()
@@ -592,15 +592,15 @@
         Default = 8, Min = 4, Max = 16, Rounding = 0, Increment = 1, Suffix = " studs/s",
     })
 
-    RagePlayerGroup:AddSlider("LegitStunSoften", {
-        Text = "Knockback Strength",
-        Default = 0.15, Min = 0.0, Max = 1.0, Rounding = 2, Increment = 0.05, Suffix = "x",
-        Tooltip = "Fraction of M1 stun knockback applied (0 = none, 1 = full).",
-    })
-
     RagePlayerGroup:AddButton({
         Text = "Capture No-Stun 10s",
         Func = function() _G.__ns_capture_request = true end,
+    })
+
+    RagePlayerGroup:AddButton({
+        Text = "Discover Hit Remote 10s",
+        Tooltip = "Logs every server->client RemoteEvent fired in the next 10s. Get hit during that window, then check console for the remote name.",
+        Func = function() _G.__ns_remote_discover_request = true end,
     })
 
     -- Event-driven combo flag. Updated by ChildAdded/Removed on Character and
@@ -663,6 +663,132 @@
     nostunBindChar(LP.Character)
     LP.CharacterAdded:Connect(nostunBindChar)
 
+    -- Primary stun trigger: TagSystem2.TagReplicate fires server->client every
+    -- time a tag changes on a character. Discovery showed this is the ONLY
+    -- remote that fires when we get hit. We just stamp nostun_lastStunAt on
+    -- every TagReplicate targeting our character. Payload[1]=tag table,
+    -- Payload[2]=target Model.
+    -- Tag names that mean "I just got hit/stunned by an enemy". Other tags
+    -- (cast/skill self-tags) are ignored so own skills don't trigger override.
+    -- Enemy-attributed stun tags only. `flingcollide`/`recentuptilt` removed —
+    -- they fire on environmental side-effects and are not reliable hit markers.
+    local STUN_TAG_NAMES = {
+        creator      = true,  -- attribution: someone hit me (filter by TrueValue)
+        WASUPFLINGED = true,
+        GotSlammed   = true,
+    }
+    do
+        local RS = game:GetService("ReplicatedStorage")
+        local TS = RS:FindFirstChild("TagSystem2")
+        local TR = TS and TS:FindFirstChild("TagReplicate")
+        if TR and TR:IsA("RemoteEvent") then
+            TR.OnClientEvent:Connect(function(payload, target)
+                local myChar = LP.Character
+                if target ~= myChar then return end
+                if type(payload) ~= "table" then return end
+                -- Self-cast guard: if our own Action folder is present, this
+                -- TagReplicate is part of our own skill cast (skill self-tags
+                -- `creator` to attribute its own damage). Ignore.
+                if myChar and myChar:FindFirstChild("Action") then return end
+                for _, entry in pairs(payload) do
+                    if type(entry) == "table" then
+                        local name = entry.TrueName
+                        if STUN_TAG_NAMES[name] then
+                            -- For `creator`, only count if the attacker is
+                            -- someone other than ourselves.
+                            if name ~= "creator" or entry.TrueValue ~= myChar then
+                                _G.__ns_lastTagAt = tick()
+                                return
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+    end
+
+    -- Remote discovery: connect to every RemoteEvent in ReplicatedStorage and
+    -- log when one fires server->client. Press "Discover Hit Remote 10s" then
+    -- get hit; we report the names + first arg type(s).
+    do
+        local discover_active = false
+        local discover_until  = 0
+        local discover_buf    = {}
+        local discover_seen   = {}  -- key=remote, val=true (already-connected)
+        local RS = game:GetService("ReplicatedStorage")
+
+        local function describeArg(a, depth)
+            depth = depth or 0
+            local t = typeof(a)
+            if t == "Instance" then return ("Instance<%s:%s>"):format(a.ClassName, a.Name) end
+            if t == "Vector3" or t == "CFrame" or t == "number" or t == "boolean" or t == "string" then
+                return ("%s(%s)"):format(t, tostring(a))
+            end
+            if t == "table" and depth < 2 then
+                local parts = {}
+                for k, v in pairs(a) do
+                    parts[#parts+1] = tostring(k) .. "=" .. describeArg(v, depth + 1)
+                    if #parts >= 8 then parts[#parts+1] = "..." break end
+                end
+                return "{" .. table.concat(parts, ", ") .. "}"
+            end
+            return t
+        end
+
+        local function hookRemote(rem)
+            if discover_seen[rem] then return end
+            discover_seen[rem] = true
+            local path = rem:GetFullName()
+            rem.OnClientEvent:Connect(function(...)
+                if not discover_active then return end
+                local args = {...}
+                local parts = {}
+                for i = 1, math.min(#args, 6) do parts[i] = describeArg(args[i]) end
+                local line = string.format("[NS-RE] %s  args=[%s]", path, table.concat(parts, ", "))
+                discover_buf[#discover_buf+1] = line
+            end)
+        end
+
+        local function rescan()
+            for _, inst in ipairs(RS:GetDescendants()) do
+                if inst:IsA("RemoteEvent") then hookRemote(inst) end
+            end
+        end
+        rescan()
+        RS.DescendantAdded:Connect(function(d)
+            if d:IsA("RemoteEvent") then hookRemote(d) end
+        end)
+
+        task.spawn(function()
+            while not Library.Unloaded do
+                if _G.__ns_remote_discover_request then
+                    _G.__ns_remote_discover_request = nil
+                    discover_buf = {}
+                    discover_active = true
+                    discover_until = tick() + 10
+                    print("[NS-RE] Listening on " .. tostring(#discover_seen) .. " RemoteEvents for 10s. Get hit now.")
+                end
+                if discover_active and tick() >= discover_until then
+                    discover_active = false
+                    local counts = {}
+                    for _, l in ipairs(discover_buf) do
+                        local name = l:match("%[NS%-RE%] (%S+)")
+                        if name then counts[name] = (counts[name] or 0) + 1 end
+                    end
+                    local list = {}
+                    for n, c in pairs(counts) do list[#list+1] = ("%dx %s"):format(c, n) end
+                    table.sort(list, function(a,b) return tonumber(a:match("^(%d+)")) > tonumber(b:match("^(%d+)")) end)
+                    local block = string.format(
+                        "\n========== NS-RE DISCOVERY (%d events, %d unique) ==========\n%s\n----- raw -----\n%s\n========== END ==========",
+                        #discover_buf, #list, table.concat(list, "\n"), table.concat(discover_buf, "\n"))
+                    print(block)
+                    pcall(function() (setclipboard or toclipboard or function() end)(block) end)
+                end
+                task.wait(0.1)
+            end
+        end)
+    end
+
     -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender hook that
     -- writes WalkSpeed = 0/5 during combo. Otherwise our write gets clobbered
     -- before physics sees it.
@@ -670,14 +796,11 @@
     local nostun_capBuf    = nil
     local nostun_lastPrint = 0
     local nostun_activeStuns = 0
-    local nostun_knockMul    = 0.15
-    local NOSTUN_MOVER_NAMES = {
-        StunBV      = true,
-        UpFling     = true,
-        DownerFling = true,
-        Hold        = true,
-        StunPos     = true,
-    }
+    local nostun_lastStunAt  = 0    -- tick() of last frame a stun mover was seen
+    -- Heuristic: own movement (dodges, jumps, dashes) puts BodyMovers on Head.
+    -- Anything that stuns you (M1 StunBV, UpFling, DownerFling, grabs, etc.)
+    -- always parents to HumanoidRootPart. So count any BodyMover/Constraint on
+    -- HRP — this covers all stunning skills regardless of their internal name.
     RunService:BindToRenderStep("LegitNoStunWS", Enum.RenderPriority.Last.Value, function()
         if _G.__ns_capture_request then
             _G.__ns_capture_request = nil
@@ -694,47 +817,20 @@
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         if not (char and hum and hum.Health > 0) then return end
 
-        -- Recompute active stun movers per frame (counter-based tracking leaked).
-        nostun_activeStuns = 0
-        if nostun_enabled then
-            for _, d in ipairs(char:GetDescendants()) do
-                if NOSTUN_MOVER_NAMES[d.Name] then
-                    nostun_activeStuns = nostun_activeStuns + 1
-                end
-            end
-        end
-        local needOverride = nostun_enabled and ((nostun_activeStuns > 0) or nostun_inCombo)
+        -- Trigger: ALL three conditions required —
+        --   1. TagReplicate with an enemy-attributed stun tag fired in the last 0.6s.
+        --   2. WalkSpeed is exactly 0 (Action lock) or 5 (creator-tag lock).
+        --      Any other low WS (slows, debuffs) is the game's intent — leave it.
+        --   3. Legit No-Stun toggle is on.
+        -- The override is now WS/JP floor ONLY: we do NOT touch velocity, so the
+        -- game's knockback BV plays out exactly as intended.
+        local lastTag  = _G.__ns_lastTagAt or 0
+        local taggedRecently = (tick() - lastTag) < 0.6
+        local wsCapped = (hum.WalkSpeed == 0) or (hum.WalkSpeed == 5)
+        local needOverride = nostun_enabled and taggedRecently and wsCapped
         if needOverride then
-            -- WalkSpeed/JumpPower floor (only in combo).
             if hum.WalkSpeed < nostun_walkout then hum.WalkSpeed = nostun_walkout end
             if hum.JumpPower < 35 then hum.JumpPower = 35 end
-            -- The game disables PlayerModule controls during Action so
-            -- Humanoid.MoveDirection stays 0 even if you press WASD. Read keys
-            -- directly and synthesize a camera-relative move direction.
-            local function readWASD()
-                local x, z = 0, 0
-                if UIS:IsKeyDown(Enum.KeyCode.W) then z = z - 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.S) then z = z + 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.A) then x = x - 1 end
-                if UIS:IsKeyDown(Enum.KeyCode.D) then x = x + 1 end
-                if x == 0 and z == 0 then return nil end
-                local cf = Camera.CFrame
-                local fwd = cf.LookVector;  fwd  = V3(fwd.X, 0, fwd.Z)
-                local rgt = cf.RightVector; rgt  = V3(rgt.X, 0, rgt.Z)
-                if fwd.Magnitude < 0.001 then return nil end
-                fwd = fwd.Unit; rgt = rgt.Unit
-                return (rgt * x + fwd * (-z)).Unit
-            end
-
-            local md = hum.MoveDirection
-            if md.Magnitude < 0.001 then md = readWASD() or V3(0,0,0) end
-
-            if hrp and md.Magnitude > 0.001 then
-                local desired = md * nostun_walkout
-                local current = hrp.AssemblyLinearVelocity
-                local blended = current * nostun_knockMul + desired * (1 - nostun_knockMul)
-                hrp.AssemblyLinearVelocity = V3(blended.X, current.Y, blended.Z)
-            end
         end
 
         if capturing and tick() - nostun_lastPrint > 0.1 then
@@ -793,9 +889,6 @@
     -- recompute nostun_activeStuns each frame in the render-step block via a
     -- lightweight descendant scan.
 
-    Options.LegitStunSoften:OnChanged(function()
-        nostun_knockMul = Options.LegitStunSoften.Value
-    end)
 
     -- Exploits: Characters 1
     local ProjGroup = Tabs.Exploits:AddLeftGroupbox("Characters 1")
