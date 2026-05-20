@@ -677,6 +677,21 @@
         WASUPFLINGED = true,
         GotSlammed   = true,
     }
+    -- Track when Action folder was added to our character. Own casts add
+    -- Action well before any TagReplicate; enemy stuns add Action and the tag
+    -- ~simultaneously. Use the elapsed time to distinguish.
+    local nostun_actionAddedAt = 0
+    local function trackActionFolder(char)
+        if not char then return end
+        local function bind(folder)
+            if folder.Name == "Action" then nostun_actionAddedAt = tick() end
+        end
+        for _, c in ipairs(char:GetChildren()) do bind(c) end
+        char.ChildAdded:Connect(bind)
+    end
+    trackActionFolder(LP.Character)
+    LP.CharacterAdded:Connect(trackActionFolder)
+
     do
         local RS = game:GetService("ReplicatedStorage")
         local TS = RS:FindFirstChild("TagSystem2")
@@ -686,10 +701,11 @@
                 local myChar = LP.Character
                 if target ~= myChar then return end
                 if type(payload) ~= "table" then return end
-                -- Self-cast guard: if our own Action folder is present, this
-                -- TagReplicate is part of our own skill cast (skill self-tags
-                -- `creator` to attribute its own damage). Ignore.
-                if myChar and myChar:FindFirstChild("Action") then return end
+                -- Self-cast guard: if Action folder has been present for >120ms
+                -- when this TagReplicate arrives, it's our own cast's tag. If
+                -- Action was just added (or absent), it's an enemy stun.
+                local action = myChar and myChar:FindFirstChild("Action")
+                if action and (tick() - nostun_actionAddedAt) > 0.12 then return end
                 for _, entry in pairs(payload) do
                     if type(entry) == "table" then
                         local name = entry.TrueName
