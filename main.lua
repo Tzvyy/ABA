@@ -612,16 +612,40 @@
     -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender hook that
     -- writes WalkSpeed = 0/5 during combo. Otherwise our write gets clobbered
     -- before physics sees it.
+    local nostun_debug = false
+    local nostun_lastPrint = 0
     RunService:BindToRenderStep("LegitNoStunWS", Enum.RenderPriority.Last.Value, function()
         if not nostun_enabled then return end
         local char = LP.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         if not (char and hum and hum.Health > 0) then return end
-        if nostunInCombo(char) then
+        local inCombo = nostunInCombo(char)
+        if inCombo then
             hum.WalkSpeed = nostun_walkout
-            -- Restore jump so the slow stride can actually carry you out.
             if hum.JumpPower < 35 then hum.JumpPower = 35 end
         end
+        if nostun_debug and tick() - nostun_lastPrint > 0.3 then
+            nostun_lastPrint = tick()
+            local movers = {}
+            if hrp then
+                for _, c in ipairs(hrp:GetChildren()) do
+                    if c:IsA("BodyMover") or c:IsA("Constraint") or c:IsA("VectorForce") or c:IsA("LinearVelocity") or c:IsA("AlignPosition") or c:IsA("BodyVelocity") or c:IsA("BodyPosition") then
+                        movers[#movers+1] = c.ClassName .. ":" .. c.Name
+                    end
+                end
+            end
+            print(string.format("[NS] inCombo=%s WS=%.1f JP=%.1f PS=%s movers=[%s]",
+                tostring(inCombo), hum.WalkSpeed, hum.JumpPower,
+                tostring(hum.PlatformStand), table.concat(movers, ",")))
+        end
+    end)
+    RagePlayerGroup:AddToggle("LegitNoStunDbg", {
+        Text = "No-Stun Debug Print",
+        Default = false,
+    })
+    Toggles.LegitNoStunDbg:OnChanged(function()
+        nostun_debug = Toggles.LegitNoStunDbg.Value
     end)
 
     Toggles.LegitNoStunTgl:OnChanged(function()
