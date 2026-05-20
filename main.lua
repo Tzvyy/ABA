@@ -577,11 +577,7 @@
 
     local nostun_enabled  = false
     local nostun_walkout  = 8
-
-    local TagSystem2 = (function()
-        local ok, m = pcall(require, game:GetService("ReplicatedStorage"):WaitForChild("TagSystem2"))
-        return ok and m or nil
-    end)()
+    local CollectionService = game:GetService("CollectionService")
 
     local RagePlayerGroup = Tabs.PvP:AddRightGroupbox("Survival")
 
@@ -637,27 +633,23 @@
         end)
         table.insert(nostun_listeners, function() addConn:Disconnect() end)
         table.insert(nostun_listeners, function() remConn:Disconnect() end)
-        -- TagSystem2.
-        if TagSystem2 then
-            for name in pairs(NOSTUN_TAGS) do
-                if TagSystem2:HasTag(char, name) then nostun_tagCnt = nostun_tagCnt + 1 end
-            end
-            local tagAdd = TagSystem2.TagAdded(char, function(tag)
-                if NOSTUN_TAGS[tag.Name] then
+        -- Tags via CollectionService (Instance:HasTag uses this under the hood).
+        for tagName in pairs(NOSTUN_TAGS) do
+            if char:HasTag(tagName) then nostun_tagCnt = nostun_tagCnt + 1 end
+            local addSig = CollectionService:GetInstanceAddedSignal(tagName):Connect(function(inst)
+                if inst == char then
                     nostun_tagCnt = nostun_tagCnt + 1
                     nostunRecompute()
                 end
             end)
-            local tagRem = TagSystem2.TagRemoved(char, function(tag)
-                if NOSTUN_TAGS[tag.Name] then
+            local remSig = CollectionService:GetInstanceRemovedSignal(tagName):Connect(function(inst)
+                if inst == char then
                     nostun_tagCnt = math.max(0, nostun_tagCnt - 1)
                     nostunRecompute()
                 end
             end)
-            table.insert(nostun_listeners, function()
-                pcall(function() TagSystem2.AddedDisconnect(tagAdd) end)
-                pcall(function() TagSystem2.AddedDisconnect(tagRem) end)
-            end)
+            table.insert(nostun_listeners, function() addSig:Disconnect() end)
+            table.insert(nostun_listeners, function() remSig:Disconnect() end)
         end
         nostunRecompute()
     end
