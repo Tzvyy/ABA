@@ -573,7 +573,7 @@
     -- out of the combo at a slow pace instead of being frozen.
     -- ============================================================================
     local NOSTUN_FOLDERS = { Action = true }
-    local NOSTUN_TAGS    = { creator = true, WASUPFLINGED = true, GotSlammed = true }
+    local NOSTUN_TAGS    = { WASUPFLINGED = true, GotSlammed = true }
 
     local nostun_enabled  = false
     local nostun_walkout  = 8
@@ -592,9 +592,15 @@
         Default = 8, Min = 4, Max = 16, Rounding = 0, Increment = 1, Suffix = " studs/s",
     })
 
-    RagePlayerGroup:AddToggle("LegitNoStunDbg", {
-        Text = "No-Stun Debug Print",
-        Default = false,
+    RagePlayerGroup:AddSlider("LegitStunSoften", {
+        Text = "Knockback Strength",
+        Default = 0.15, Min = 0.0, Max = 1.0, Rounding = 2, Increment = 0.05, Suffix = "x",
+        Tooltip = "Fraction of M1 stun knockback applied (0 = none, 1 = full).",
+    })
+
+    RagePlayerGroup:AddButton({
+        Text = "Capture No-Stun 10s",
+        Func = function() _G.__ns_capture_request = true end,
     })
 
     -- Event-driven combo flag. Updated by ChildAdded/Removed on Character and
@@ -660,36 +666,110 @@
     -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender hook that
     -- writes WalkSpeed = 0/5 during combo. Otherwise our write gets clobbered
     -- before physics sees it.
-    local nostun_debug = false
+    local nostun_capUntil  = 0
+    local nostun_capBuf    = nil
     local nostun_lastPrint = 0
+    local nostun_activeStuns = 0
+    local nostun_knockMul    = 0.15
+    local NOSTUN_MOVER_NAMES = {
+        StunBV      = true,
+        UpFling     = true,
+        DownerFling = true,
+        Hold        = true,
+        StunPos     = true,
+    }
     RunService:BindToRenderStep("LegitNoStunWS", Enum.RenderPriority.Last.Value, function()
-        if not nostun_enabled then return end
+        if _G.__ns_capture_request then
+            _G.__ns_capture_request = nil
+            nostun_capBuf   = {}
+            nostun_capUntil = tick() + 10
+            nostun_lastPrint = 0
+            print("[NS] capturing 10s...")
+        end
+        local capturing = tick() < nostun_capUntil
+        if not nostun_enabled and not capturing and not nostun_capBuf then return end
+
         local char = LP.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         if not (char and hum and hum.Health > 0) then return end
-        if nostun_inCombo then
-            hum.WalkSpeed = nostun_walkout
-            if hum.JumpPower < 35 then hum.JumpPower = 35 end
-        end
-        if nostun_debug and tick() - nostun_lastPrint > 0.1 then
-            nostun_lastPrint = tick()
-            local movers = {}
-            if hrp then
-                for _, c in ipairs(hrp:GetChildren()) do
-                    if c:IsA("BodyMover") or c:IsA("Constraint") or c:IsA("VectorForce") or c:IsA("LinearVelocity") or c:IsA("AlignPosition") or c:IsA("BodyVelocity") or c:IsA("BodyPosition") then
-                        movers[#movers+1] = c.ClassName .. ":" .. c.Name .. " v=" .. tostring(c:IsA("BodyVelocity") and c.Velocity or "")
-                    end
+
+        -- Recompute active stun movers per frame (counter-based tracking leaked).
+        nostun_activeStuns = 0
+        if nostun_enabled then
+            for _, d in ipairs(char:GetDescendants()) do
+                if NOSTUN_MOVER_NAMES[d.Name] then
+                    nostun_activeStuns = nostun_activeStuns + 1
                 end
             end
-            print(string.format("[NS] inCombo=%s (f=%d t=%d) WS=%.1f JP=%.1f PS=%s movers=[%s]",
-                tostring(nostun_inCombo), nostun_folderCnt, nostun_tagCnt,
-                hum.WalkSpeed, hum.JumpPower,
-                tostring(hum.PlatformStand), table.concat(movers, ",")))
         end
-    end)
-    Toggles.LegitNoStunDbg:OnChanged(function()
-        nostun_debug = Toggles.LegitNoStunDbg.Value
+        local needOverride = nostun_enabled and ((nostun_activeStuns > 0) or nostun_inCombo)
+        if needOverride then
+            -- WalkSpeed/JumpPower floor (only in combo).
+            if hum.WalkSpeed < nostun_walkout then hum.WalkSpeed = nostun_walkout end
+            if hum.JumpPower < 35 then hum.JumpPower = 35 end
+            -- The game disables PlayerModule controls during Action so
+            -- Humanoid.MoveDirection stays 0 even if you press WASD. Read keys
+            -- directly and synthesize a camera-relative move direction.
+            local function readWASD()
+                local x, z = 0, 0
+                if UIS:IsKeyDown(Enum.KeyCode.W) then z = z - 1 end
+                if UIS:IsKeyDown(Enum.KeyCode.S) then z = z + 1 end
+                if UIS:IsKeyDown(Enum.KeyCode.A) then x = x - 1 end
+                if UIS:IsKeyDown(Enum.KeyCode.D) then x = x + 1 end
+                if x == 0 and z == 0 then return nil end
+                local cf = Camera.CFrame
+                local fwd = cf.LookVector;  fwd  = V3(fwd.X, 0, fwd.Z)
+                local rgt = cf.RightVector; rgt  = V3(rgt.X, 0, rgt.Z)
+                if fwd.Magnitude < 0.001 then return nil end
+                fwd = fwd.Unit; rgt = rgt.Unit
+                return (rgt * x + fwd * (-z)).Unit
+            end
+
+            local md = hum.MoveDirection
+            if md.Magnitude < 0.001 then md = readWASD() or V3(0,0,0) end
+
+            if hrp and md.Magnitude > 0.001 then
+                local desired = md * nostun_walkout
+                local current = hrp.AssemblyLinearVelocity
+                local blended = current * nostun_knockMul + desired * (1 - nostun_knockMul)
+                hrp.AssemblyLinearVelocity = V3(blended.X, current.Y, blended.Z)
+            end
+        end
+
+        if capturing and tick() - nostun_lastPrint > 0.1 then
+            nostun_lastPrint = tick()
+            local movers = {}
+            for _, c in ipairs(char:GetDescendants()) do
+                if c:IsA("BodyMover") or c:IsA("Constraint") then
+                    local extra = ""
+                    if c:IsA("BodyVelocity") then extra = " v=" .. tostring(c.Velocity) .. " mf=" .. tostring(c.MaxForce) end
+                    if c:IsA("BodyPosition") then extra = " p=" .. tostring(c.Position) .. " mf=" .. tostring(c.MaxForce) end
+                    if c:IsA("AlignPosition") then extra = " att0=" .. tostring(c.Attachment0) .. " att1=" .. tostring(c.Attachment1) end
+                    movers[#movers+1] = string.format("%s/%s%s", (c.Parent and c.Parent.Name or "?"), c.ClassName, extra)
+                end
+            end
+            local vel = hrp and hrp.AssemblyLinearVelocity or V3(0,0,0)
+            local md  = hum.MoveDirection
+            local line = string.format("[NS] iC=%s WS=%.1f JP=%.1f PS=%s vel=(%.1f,%.1f,%.1f) MD=(%.2f,%.2f,%.2f) movers=[%s]",
+                tostring(nostun_inCombo), hum.WalkSpeed, hum.JumpPower, tostring(hum.PlatformStand),
+                vel.X, vel.Y, vel.Z, md.X, md.Y, md.Z, table.concat(movers, " | "))
+            if nostun_capBuf then nostun_capBuf[#nostun_capBuf+1] = line end
+        end
+
+        if not capturing and nostun_capBuf then
+            local buf = nostun_capBuf
+            nostun_capBuf = nil
+            local txt = table.concat(buf, "\n")
+            local copyFn = rawget(getfenv(), "setclipboard")
+                or rawget(getfenv(), "toclipboard")
+                or rawget(getfenv(), "set_clipboard")
+                or (Clipboard and Clipboard.set)
+            local copied = false
+            if copyFn then copied = pcall(copyFn, txt) end
+            print(string.format("\n========== NS CAPTURE (%d lines, clipboard=%s) ==========\n%s\n========== END ==========",
+                #buf, tostring(copied), txt))
+        end
     end)
 
     Toggles.LegitNoStunTgl:OnChanged(function()
@@ -698,6 +778,23 @@
 
     Options.LegitWalkoutSpeed:OnChanged(function()
         nostun_walkout = Options.LegitWalkoutSpeed.Value
+    end)
+
+    -- Server-spawned BodyMovers (StunBV/UpFling/DownerFling/etc) are network-
+    -- authoritative during stun, so modifying them client-side gets reverted.
+    -- Instead we track when one is active on the character and, while active,
+    -- override AssemblyLinearVelocity each frame to your input direction at
+    -- the walk-out speed. The stun mover still "exists" server-side (looks legit)
+    -- but locally you drift in your input direction.
+    -- NOSTUN_MOVER_NAMES, nostun_knockMul, nostun_activeStuns declared above (must precede BindToRenderStep closure)
+
+    -- (counter-based tracking was unreliable — server-spawned BVs can be
+    -- destroyed without DescendantRemoving firing in our handler.) We now
+    -- recompute nostun_activeStuns each frame in the render-step block via a
+    -- lightweight descendant scan.
+
+    Options.LegitStunSoften:OnChanged(function()
+        nostun_knockMul = Options.LegitStunSoften.Value
     end)
 
     -- Exploits: Characters 1
