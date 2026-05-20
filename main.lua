@@ -596,6 +596,11 @@
         Default = 8, Min = 4, Max = 16, Rounding = 0, Increment = 1, Suffix = " studs/s",
     })
 
+    RagePlayerGroup:AddToggle("LegitNoStunDbg", {
+        Text = "No-Stun Debug Print",
+        Default = false,
+    })
+
     -- Event-driven combo flag. Updated by ChildAdded/Removed on Character and
     -- TagSystem2 TagAdded/Removed on the same. Avoids polling-window misses.
     local nostun_inCombo   = false
@@ -691,10 +696,6 @@
                 tostring(hum.PlatformStand), table.concat(movers, ",")))
         end
     end)
-    RagePlayerGroup:AddToggle("LegitNoStunDbg", {
-        Text = "No-Stun Debug Print",
-        Default = false,
-    })
     Toggles.LegitNoStunDbg:OnChanged(function()
         nostun_debug = Toggles.LegitNoStunDbg.Value
     end)
