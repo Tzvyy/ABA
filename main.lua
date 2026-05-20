@@ -609,14 +609,18 @@
         return false
     end
 
-    local nostunConn
-    RunService.Heartbeat:Connect(function()
+    -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender hook that
+    -- writes WalkSpeed = 0/5 during combo. Otherwise our write gets clobbered
+    -- before physics sees it.
+    RunService:BindToRenderStep("LegitNoStunWS", Enum.RenderPriority.Last.Value, function()
         if not nostun_enabled then return end
         local char = LP.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
         if not (char and hum and hum.Health > 0) then return end
-        if nostunInCombo(char) and hum.WalkSpeed < nostun_walkout then
+        if nostunInCombo(char) then
             hum.WalkSpeed = nostun_walkout
+            -- Restore jump so the slow stride can actually carry you out.
+            if hum.JumpPower < 35 then hum.JumpPower = 35 end
         end
     end)
 
@@ -932,6 +936,7 @@
         if TweenConnection then TweenConnection:Disconnect() end
         stopProjectileWatcher()
         hitboxStop()
+        pcall(function() RunService:UnbindFromRenderStep("LegitNoStunWS") end)
         FOVCircle:Remove()
         CamLockFOVCircle:Remove()
         for k in pairs(espCache) do cleanEsp(k) end
