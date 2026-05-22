@@ -564,123 +564,313 @@
     end)
 
     -- ============================================================================
-    -- LEGIT NO-STUN (slow walk-out)
-    -- During an M1 combo the LocalCharacterScript drops WalkSpeed to 0 (Action
-    -- folder) or 5 (`creator` tag). We don't remove those — the hit reaction still
-    -- plays normally, server still thinks we're stunned. We just override
-    -- Humanoid.WalkSpeed every Heartbeat (which runs AFTER the script's PreRender
-    -- WalkSpeed write) to the user-configured walk-out value, so we visibly drift
-    -- out of the combo at a slow pace instead of being frozen.
+    -- LEGIT NO-STUN (velocity-only walk-out)
+    --
+    -- During an M1 / light-skill stun the game pins `Humanoid.WalkSpeed = 5` and
+    -- suppresses humanoid acceleration. We never touch WalkSpeed (server-safe
+    -- if the game adds a sanity check); instead, between knockback BVs, we
+    -- write `HumanoidRootPart.AssemblyLinearVelocity` from WASD at the user's
+    -- configured walk-out speed.
+    --
+    -- Gates (ALL must be true to override):
+    --   * toggle on
+    --   * an enemy-attributed stun tag (TagSystem2.TagReplicate) fired in last 0.6s
+    --   * `Humanoid.WalkSpeed == 5` (M1 slow-walk; WS==0 grabs are NOT touched)
+    --   * no StunBV/UpFling/DownerFling currently on HRP (knockback plays untouched)
     -- ============================================================================
-    local NOSTUN_FOLDERS = { Action = true }
-    local NOSTUN_TAGS    = { WASUPFLINGED = true, GotSlammed = true }
+    local nostun_enabled = false
+    local nostun_walkout = 8
+    local nostun_lastTagAt     = 0
+    local nostun_actionAddedAt = 0
 
-    local nostun_enabled  = false
-    local nostun_walkout  = 8
-    local CollectionService = game:GetService("CollectionService")
+    -- Enemy-attributed stun tag names. `creator` is filtered by TrueValue so
+    -- our own casts don't trigger.
+    local STUN_TAG_NAMES = { creator = true, WASUPFLINGED = true, GotSlammed = true }
 
-    local RagePlayerGroup = Tabs.PvP:AddRightGroupbox("Survival")
+    local CombatGroup = Tabs.PvP:AddRightGroupbox("Combat")
 
-    RagePlayerGroup:AddToggle("LegitNoStunTgl", {
+    CombatGroup:AddToggle("LegitNoStunTgl", {
         Text = "Legit No-Stun",
         Default = false,
-        Tooltip = "Walk slowly out of M1 combos instead of being frozen.",
+        Tooltip = "Walk out of M1 combos at the configured speed instead of being frozen.",
     })
 
-    RagePlayerGroup:AddSlider("LegitWalkoutSpeed", {
+    CombatGroup:AddSlider("LegitWalkoutSpeed", {
         Text = "Walk-out Speed",
-        Default = 8, Min = 4, Max = 16, Rounding = 0, Increment = 1, Suffix = " studs/s",
+        Default = 8, Min = 4, Max = 24, Rounding = 0, Increment = 1, Suffix = " studs/s",
     })
 
-    RagePlayerGroup:AddButton({
-        Text = "Capture No-Stun 10s",
-        Func = function() _G.__ns_capture_request = true end,
+    Toggles.LegitNoStunTgl:OnChanged(function()
+        nostun_enabled = Toggles.LegitNoStunTgl.Value
+    end)
+    Options.LegitWalkoutSpeed:OnChanged(function()
+        nostun_walkout = Options.LegitWalkoutSpeed.Value
+    end)
+
+    -- ============================================================================
+    -- AUTO TRADE — when blocking (F held) and an enemy hit registers (creator
+    -- tag on our character), instantly fire one M1 back. ABA blocks the impact
+    -- automatically since we're still holding F, so the trade is a free hit.
+    -- ============================================================================
+    CombatGroup:AddToggle("AutoTradeTgl", {
+        Text = "Auto M1 Trade",
+        Default = false,
+        Tooltip = "When an enemy M1 hits your block, instantly trade with an M1 back.",
     })
+    local autotrade_enabled = false
+    local autotrade_lastAt  = 0
+    Toggles.AutoTradeTgl:OnChanged(function()
+        autotrade_enabled = Toggles.AutoTradeTgl.Value
+    end)
 
-    RagePlayerGroup:AddButton({
-        Text = "Discover Hit Remote 10s",
-        Tooltip = "Logs every server->client RemoteEvent fired in the next 10s. Get hit during that window, then check console for the remote name.",
-        Func = function() _G.__ns_remote_discover_request = true end,
+    -- Auto Block lives inside a DependencyBox gated on Auto M1 Trade.
+    local AutoBlockDep = CombatGroup:AddDependencyBox()
+    AutoBlockDep:AddToggle("AutoBlockTgl", {
+        Text = "Auto Block",
+        Default = false,
+        Tooltip = "When an enemy starts an M1 within range, auto-press block briefly. Skips the combo-finisher M1 which breaks block.",
     })
+    AutoBlockDep:AddSlider("AutoBlockRange", {
+        Text = "Auto Block Range",
+        Default = 12, Min = 4, Max = 20, Rounding = 0, Increment = 1, Suffix = " studs",
+    })
+    AutoBlockDep:SetupDependencies({ { Toggles.AutoTradeTgl, true } })
 
-    -- Event-driven combo flag. Updated by ChildAdded/Removed on Character and
-    -- TagSystem2 TagAdded/Removed on the same. Avoids polling-window misses.
-    local nostun_inCombo   = false
-    local nostun_folderCnt = 0
-    local nostun_tagCnt    = 0
-    local function nostunRecompute() nostun_inCombo = (nostun_folderCnt + nostun_tagCnt) > 0 end
+    local autoblock_enabled = false
+    local autoblock_range   = 12
+    local autoblock_lastAt  = 0
+    local autoblock_holding = false
+    Toggles.AutoBlockTgl:OnChanged(function()
+        autoblock_enabled = Toggles.AutoBlockTgl.Value
+    end)
+    Options.AutoBlockRange:OnChanged(function()
+        autoblock_range = Options.AutoBlockRange.Value
+    end)
 
-    local nostun_listeners = {}  -- list of disconnect callbacks
-    local function nostunUnbindChar()
-        for _, d in ipairs(nostun_listeners) do pcall(d) end
-        table.clear(nostun_listeners)
-        nostun_folderCnt, nostun_tagCnt = 0, 0
-        nostunRecompute()
-    end
-
-    local function nostunBindChar(char)
-        nostunUnbindChar()
-        if not char then return end
-        -- Initial folder scan.
-        for _, c in ipairs(char:GetChildren()) do
-            if NOSTUN_FOLDERS[c.Name] then nostun_folderCnt = nostun_folderCnt + 1 end
-        end
-        local addConn = char.ChildAdded:Connect(function(c)
-            if NOSTUN_FOLDERS[c.Name] then
-                nostun_folderCnt = nostun_folderCnt + 1
-                nostunRecompute()
-            end
-        end)
-        local remConn = char.ChildRemoved:Connect(function(c)
-            if NOSTUN_FOLDERS[c.Name] then
-                nostun_folderCnt = math.max(0, nostun_folderCnt - 1)
-                nostunRecompute()
-            end
-        end)
-        table.insert(nostun_listeners, function() addConn:Disconnect() end)
-        table.insert(nostun_listeners, function() remConn:Disconnect() end)
-        -- Tags via CollectionService (Instance:HasTag uses this under the hood).
-        for tagName in pairs(NOSTUN_TAGS) do
-            if char:HasTag(tagName) then nostun_tagCnt = nostun_tagCnt + 1 end
-            local addSig = CollectionService:GetInstanceAddedSignal(tagName):Connect(function(inst)
-                if inst == char then
-                    nostun_tagCnt = nostun_tagCnt + 1
-                    nostunRecompute()
-                end
-            end)
-            local remSig = CollectionService:GetInstanceRemovedSignal(tagName):Connect(function(inst)
-                if inst == char then
-                    nostun_tagCnt = math.max(0, nostun_tagCnt - 1)
-                    nostunRecompute()
-                end
-            end)
-            table.insert(nostun_listeners, function() addSig:Disconnect() end)
-            table.insert(nostun_listeners, function() remSig:Disconnect() end)
-        end
-        nostunRecompute()
-    end
-
-    nostunBindChar(LP.Character)
-    LP.CharacterAdded:Connect(nostunBindChar)
-
-    -- Primary stun trigger: TagSystem2.TagReplicate fires server->client every
-    -- time a tag changes on a character. Discovery showed this is the ONLY
-    -- remote that fires when we get hit. We just stamp nostun_lastStunAt on
-    -- every TagReplicate targeting our character. Payload[1]=tag table,
-    -- Payload[2]=target Model.
-    -- Tag names that mean "I just got hit/stunned by an enemy". Other tags
-    -- (cast/skill self-tags) are ignored so own skills don't trigger override.
-    -- Enemy-attributed stun tags only. `flingcollide`/`recentuptilt` removed —
-    -- they fire on environmental side-effects and are not reliable hit markers.
-    local STUN_TAG_NAMES = {
-        creator      = true,  -- attribution: someone hit me (filter by TrueValue)
-        WASUPFLINGED = true,
-        GotSlammed   = true,
+    -- Universal ABA enemy-M1 animation IDs (captured via discovery).
+    -- The first 4 are normal M1s, the last is the combo-finisher (length 1.00)
+    -- which BREAKS block — we exclude it from auto-block but allow auto-trade
+    -- to still respond if the user is already manually blocking.
+    local ENEMY_M1_ANIM_IDS = {
+        ["rbxassetid://1461128166"] = true,
+        ["rbxassetid://1461128859"] = true,
+        ["rbxassetid://1461136273"] = true,
+        ["rbxassetid://1461136875"] = true,
     }
-    -- Track when Action folder was added to our character. Own casts add
-    -- Action well before any TagReplicate; enemy stuns add Action and the tag
-    -- ~simultaneously. Use the elapsed time to distinguish.
-    local nostun_actionAddedAt = 0
+    local ENEMY_M1_FINISHER_IDS = {
+        ["rbxassetid://1461137417"] = true,
+    }
+
+    -- Resolve the Input remote (Backpack/Input) used for BlockOn/BlockOff/M1.
+    -- Backpack is rebuilt on respawn so we re-resolve after CharacterAdded.
+    local inputRemote
+    local function refreshInputRemote()
+        local bp = LP:FindFirstChildOfClass("Backpack")
+        inputRemote = bp and bp:FindFirstChild("Input")
+    end
+    refreshInputRemote()
+    LP.CharacterAdded:Connect(function() task.delay(0.5, refreshInputRemote) end)
+
+    -- Standing Downslam — toggle gate + Hold-only keybind. While the toggle is
+    -- on, every press of the bound key fires an air-M1 once.
+    local function fireDownslam()
+        if not inputRemote then refreshInputRemote() end
+        if not inputRemote then return end
+        local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        inputRemote:FireServer("M1", {
+            air = true,
+            skeyreal = false,
+            skeydown = true,
+            mousehit = Camera.CFrame,
+            md = hum and hum.MoveDirection or V3(0, 0, 0),
+        })
+    end
+
+    local downslamToggle = CombatGroup:AddToggle("DownslamM1Tgl", {
+        Text = "Standing Downslam",
+        Default = false,
+        Tooltip = "While on, the bound key fires an air-M1 (Standing Downslam) once per press.",
+    })
+    downslamToggle:AddKeyPicker("DownslamM1Key", {
+        Default = "J",
+        Mode = "Hold",
+        Modes = { "Hold" },
+        Text = "Downslam Key",
+        SyncToggleState = false,
+        NoUI = false,
+    })
+    local downslamKey = Options.DownslamM1Key or Toggles.DownslamM1Key
+    if downslamKey and downslamKey.OnClick then
+        downslamKey:OnClick(function()
+            if not Toggles.DownslamM1Tgl.Value then return end
+            fireDownslam()
+        end)
+    else
+        warn("[ABP] DownslamM1Key keypicker not found in Options/Toggles")
+    end
+
+    -- Animation discovery — logs animations played on every other player for 10s.
+    CombatGroup:AddButton({
+        Text = "Capture Enemy Anims 10s",
+        Tooltip = "Logs Animator.AnimationPlayed on all other players for 10s. Have an enemy spam M1 during the window.",
+        Func = function() _G.__abp_anim_capture_request = true end,
+    })
+
+    task.spawn(function()
+        local Players = game:GetService("Players")
+        local active, untilT, buf = false, 0, nil
+        local bound = setmetatable({}, { __mode = "k" })
+
+        local function bindChar(label, char)
+            if not char or bound[char] then return end
+            bound[char] = true
+            task.spawn(function()
+                local hum = char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5)
+                local animator = hum and (hum:FindFirstChildOfClass("Animator") or hum:WaitForChild("Animator", 5))
+                if not animator then return end
+                animator.AnimationPlayed:Connect(function(track)
+                    local anim = track.Animation
+                    local id   = anim and anim.AnimationId
+                    if not id then return end
+
+                    -- Discovery capture (button-driven).
+                    if active then
+                        buf[#buf+1] = string.format("[%6.3fs] %s | id=%s name=%s len=%.2f",
+                            tick() - (untilT - 10), label,
+                            tostring(id), tostring(anim.Name), tostring(track.Length))
+                    end
+
+                    -- Live trigger: only on real M1 anims.
+                    local isM1       = ENEMY_M1_ANIM_IDS[id]
+                    local isFinisher = ENEMY_M1_FINISHER_IDS[id]
+                    if not (isM1 or isFinisher) then return end
+                    if not (autotrade_enabled or autoblock_enabled) then return end
+
+                    local myChar = LP.Character
+                    local myHrp  = myChar and myChar:FindFirstChild("HumanoidRootPart")
+                    local enHrp  = char:FindFirstChild("HumanoidRootPart")
+                    if not (myHrp and enHrp) then return end
+
+                    -- Range gate (both features share the autoblock_range).
+                    local dist = (enHrp.Position - myHrp.Position).Magnitude
+                    if dist > autoblock_range then return end
+
+                    -- Self-cast guard: never act if we're mid-skill.
+                    if myChar:FindFirstChild("Action") then return end
+
+                    local fDown = UIS:IsKeyDown(Enum.KeyCode.F)
+                    local now   = tick()
+
+                    -- Only act on real M1 hits, and only if cooldown passed.
+                    if not isM1 then return end
+                    if (now - autotrade_lastAt) <= 0.6 then return end
+                    if autoblock_holding then return end -- already in sequence
+
+                    -- Decide if we can engage: either user is blocking, or
+                    -- Auto Block is on (we'll raise block ourselves).
+                    local needRaise = (not fDown) and autoblock_enabled
+                    local canTrade  = autotrade_enabled and (fDown or needRaise)
+                    if not canTrade then return end
+
+                    autotrade_lastAt  = now
+                    autoblock_holding = needRaise -- mark so other anims don't double-fire
+                    task.spawn(function()
+                        if not inputRemote then refreshInputRemote() end
+                        if not inputRemote then autoblock_holding = false; return end
+
+                        -- Raise block first if user wasn't already holding F.
+                        if needRaise then
+                            inputRemote:FireServer("BlockOn")
+                        end
+
+                        -- Wait for impact to land on block.
+                        task.wait(0.25)
+
+                        local h2  = myChar:FindFirstChildOfClass("Humanoid")
+                        local air = h2 and (h2:GetState() == Enum.HumanoidStateType.Freefall) or false
+                        inputRemote:FireServer("BlockOff")
+                        task.wait(0.05)
+                        inputRemote:FireServer("M1", {
+                            air = air,
+                            skeyreal = false,
+                            skeydown = true,
+                            mousehit = Camera.CFrame,
+                            md = h2 and h2.MoveDirection or V3(0, 0, 0),
+                        })
+
+                        -- Re-raise block if user is still holding F (manual block).
+                        if UIS:IsKeyDown(Enum.KeyCode.F) then
+                            inputRemote:FireServer("BlockOn")
+                        end
+                        autoblock_holding = false
+                    end)
+                end)
+            end)
+        end
+
+        -- Players (real opponents).
+        local function bindPlayer(plr)
+            if plr == LP then return end
+            if plr.Character then bindChar(plr.Name, plr.Character) end
+            plr.CharacterAdded:Connect(function(c) bindChar(plr.Name, c) end)
+        end
+        for _, p in ipairs(Players:GetPlayers()) do bindPlayer(p) end
+        Players.PlayerAdded:Connect(bindPlayer)
+
+        -- NPCs / dummies under workspace.Live.
+        local function maybeBindLive(inst)
+            if not inst:IsA("Model") then return end
+            -- Skip our own character (also lives under Live).
+            if inst == LP.Character then return end
+            -- Bind any Model with a Humanoid (Attack Dummy, mobs, etc).
+            if inst:FindFirstChildOfClass("Humanoid") then
+                bindChar("NPC:" .. inst.Name, inst)
+            else
+                -- Humanoid may be added later; wait a moment.
+                task.delay(0.5, function()
+                    if inst.Parent and inst:FindFirstChildOfClass("Humanoid") then
+                        bindChar("NPC:" .. inst.Name, inst)
+                    end
+                end)
+            end
+        end
+        local Live = workspace:FindFirstChild("Live")
+        if Live then
+            for _, c in ipairs(Live:GetChildren()) do maybeBindLive(c) end
+            Live.ChildAdded:Connect(maybeBindLive)
+        else
+            workspace.ChildAdded:Connect(function(c)
+                if c.Name == "Live" then
+                    for _, k in ipairs(c:GetChildren()) do maybeBindLive(k) end
+                    c.ChildAdded:Connect(maybeBindLive)
+                end
+            end)
+        end
+
+        while not Library.Unloaded do
+            if _G.__abp_anim_capture_request then
+                _G.__abp_anim_capture_request = nil
+                buf = {}; active = true; untilT = tick() + 10
+                print("[ABP-ANIM] capturing 10s...")
+            end
+            if active and tick() >= untilT then
+                active = false
+                local txt = table.concat(buf, "\n")
+                local copyFn = rawget(getfenv(), "setclipboard") or rawget(getfenv(), "toclipboard")
+                local copied = false
+                if copyFn then copied = pcall(copyFn, txt) end
+                print(string.format("\n========== ABP ANIM DUMP (%d entries, clipboard=%s) ==========\n%s\n========== END ==========",
+                    #buf, tostring(copied), txt))
+                buf = nil
+            end
+            task.wait(0.1)
+        end
+    end)
+
+    -- Self-cast guard: own casts add the `Action` folder well before any
+    -- TagReplicate; enemy stuns add Action and the tag ~simultaneously. If
+    -- Action has been present for >120 ms when a TagReplicate arrives, it's
+    -- our own cast — ignore.
     local function trackActionFolder(char)
         if not char then return end
         local function bind(folder)
@@ -696,218 +886,75 @@
         local RS = game:GetService("ReplicatedStorage")
         local TS = RS:WaitForChild("TagSystem2", 30)
         local TR = TS and TS:WaitForChild("TagReplicate", 30)
-        if TR and TR:IsA("RemoteEvent") then
-            print("[NS] TagReplicate listener connected.")
-            TR.OnClientEvent:Connect(function(payload, target)
-                local myChar = LP.Character
-                if target ~= myChar then return end
-                if type(payload) ~= "table" then return end
-                -- Self-cast guard: if Action folder has been present for >120ms
-                -- when this TagReplicate arrives, it's our own cast's tag. If
-                -- Action was just added (or absent), it's an enemy stun.
-                local action = myChar and myChar:FindFirstChild("Action")
-                if action and (tick() - nostun_actionAddedAt) > 0.12 then return end
-                for _, entry in pairs(payload) do
-                    if type(entry) == "table" then
-                        local name = entry.TrueName
-                        if STUN_TAG_NAMES[name] then
-                            -- For `creator`, only count if the attacker is
-                            -- someone other than ourselves.
-                            if name ~= "creator" or entry.TrueValue ~= myChar then
-                                _G.__ns_lastTagAt = tick()
-                                return
-                            end
+        if not (TR and TR:IsA("RemoteEvent")) then return end
+        TR.OnClientEvent:Connect(function(payload, target)
+            local myChar = LP.Character
+            if target ~= myChar or type(payload) ~= "table" then return end
+            local action = myChar and myChar:FindFirstChild("Action")
+            local actionStale = action and (tick() - nostun_actionAddedAt) > 0.12
+
+            for _, entry in pairs(payload) do
+                if type(entry) == "table" then
+                    local name = entry.TrueName
+                    local isEnemyTag = STUN_TAG_NAMES[name]
+                        and (name ~= "creator" or entry.TrueValue ~= myChar)
+
+                    if isEnemyTag then
+                        -- No-stun trigger (skip if it's our own cast).
+                        if not actionStale then
+                            nostun_lastTagAt = tick()
                         end
+                        return
                     end
                 end
-            end)
-        else
-            print("[NS] TagReplicate not found (TagSystem2 missing).")
-        end
+            end
+        end)
     end)
 
-    -- Remote discovery: connect to every RemoteEvent in ReplicatedStorage and
-    -- log when one fires server->client. Press "Discover Hit Remote 10s" then
-    -- get hit; we report the names + first arg type(s).
-    do
-        local discover_active = false
-        local discover_until  = 0
-        local discover_buf    = {}
-        local discover_seen   = {}  -- key=remote, val=true (already-connected)
-        local RS = game:GetService("ReplicatedStorage")
-
-        local function describeArg(a, depth)
-            depth = depth or 0
-            local t = typeof(a)
-            if t == "Instance" then return ("Instance<%s:%s>"):format(a.ClassName, a.Name) end
-            if t == "Vector3" or t == "CFrame" or t == "number" or t == "boolean" or t == "string" then
-                return ("%s(%s)"):format(t, tostring(a))
-            end
-            if t == "table" and depth < 2 then
-                local parts = {}
-                for k, v in pairs(a) do
-                    parts[#parts+1] = tostring(k) .. "=" .. describeArg(v, depth + 1)
-                    if #parts >= 8 then parts[#parts+1] = "..." break end
-                end
-                return "{" .. table.concat(parts, ", ") .. "}"
-            end
-            return t
-        end
-
-        local function hookRemote(rem)
-            if discover_seen[rem] then return end
-            discover_seen[rem] = true
-            local path = rem:GetFullName()
-            rem.OnClientEvent:Connect(function(...)
-                if not discover_active then return end
-                local args = {...}
-                local parts = {}
-                for i = 1, math.min(#args, 6) do parts[i] = describeArg(args[i]) end
-                local line = string.format("[NS-RE] %s  args=[%s]", path, table.concat(parts, ", "))
-                discover_buf[#discover_buf+1] = line
-            end)
-        end
-
-        local function rescan()
-            for _, inst in ipairs(RS:GetDescendants()) do
-                if inst:IsA("RemoteEvent") then hookRemote(inst) end
-            end
-        end
-        rescan()
-        RS.DescendantAdded:Connect(function(d)
-            if d:IsA("RemoteEvent") then hookRemote(d) end
-        end)
-
-        task.spawn(function()
-            while not Library.Unloaded do
-                if _G.__ns_remote_discover_request then
-                    _G.__ns_remote_discover_request = nil
-                    discover_buf = {}
-                    discover_active = true
-                    discover_until = tick() + 10
-                    print("[NS-RE] Listening on " .. tostring(#discover_seen) .. " RemoteEvents for 10s. Get hit now.")
-                end
-                if discover_active and tick() >= discover_until then
-                    discover_active = false
-                    local counts = {}
-                    for _, l in ipairs(discover_buf) do
-                        local name = l:match("%[NS%-RE%] (%S+)")
-                        if name then counts[name] = (counts[name] or 0) + 1 end
-                    end
-                    local list = {}
-                    for n, c in pairs(counts) do list[#list+1] = ("%dx %s"):format(c, n) end
-                    table.sort(list, function(a,b) return tonumber(a:match("^(%d+)")) > tonumber(b:match("^(%d+)")) end)
-                    local block = string.format(
-                        "\n========== NS-RE DISCOVERY (%d events, %d unique) ==========\n%s\n----- raw -----\n%s\n========== END ==========",
-                        #discover_buf, #list, table.concat(list, "\n"), table.concat(discover_buf, "\n"))
-                    print(block)
-                    pcall(function() (setclipboard or toclipboard or function() end)(block) end)
-                end
-                task.wait(0.1)
-            end
-        end)
-    end
-
-    -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender hook that
-    -- writes WalkSpeed = 0/5 during combo. Otherwise our write gets clobbered
-    -- before physics sees it.
-    local nostun_capUntil  = 0
-    local nostun_capBuf    = nil
-    local nostun_lastPrint = 0
-    local nostun_activeStuns = 0
-    local nostun_lastStunAt  = 0    -- tick() of last frame a stun mover was seen
-    -- Heuristic: own movement (dodges, jumps, dashes) puts BodyMovers on Head.
-    -- Anything that stuns you (M1 StunBV, UpFling, DownerFling, grabs, etc.)
-    -- always parents to HumanoidRootPart. So count any BodyMover/Constraint on
-    -- HRP — this covers all stunning skills regardless of their internal name.
+    -- Bind LAST so we run AFTER the LocalCharacterScript's PreRender writes.
     RunService:BindToRenderStep("LegitNoStunWS", Enum.RenderPriority.Last.Value, function()
-        if _G.__ns_capture_request then
-            _G.__ns_capture_request = nil
-            nostun_capBuf   = {}
-            nostun_capUntil = tick() + 10
-            nostun_lastPrint = 0
-            print("[NS] capturing 10s...")
-        end
-        local capturing = tick() < nostun_capUntil
-        if not nostun_enabled and not capturing and not nostun_capBuf then return end
+        if not nostun_enabled then return end
+        if (tick() - nostun_lastTagAt) >= 0.6 then return end
 
         local char = LP.Character
         local hum  = char and char:FindFirstChildOfClass("Humanoid")
-        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-        if not (char and hum and hum.Health > 0) then return end
+        if not (hum and hum.Health > 0 and hum.WalkSpeed == 5) then return end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
 
-        -- Trigger: enemy-attributed stun tag fired recently AND WalkSpeed is
-        -- exactly 5 (the M1/light-skill slow-walk lock). WS==0 (grabs/animation
-        -- locks) is intentionally NOT touched — those should stay fully locked.
-        -- We do NOT touch knockback BVs, JumpPower, or velocity. Just raise WS.
-        local lastTag  = _G.__ns_lastTagAt or 0
-        local taggedRecently = (tick() - lastTag) < 0.6
-        local wsCapped = (hum.WalkSpeed == 5)
-        local needOverride = nostun_enabled and taggedRecently and wsCapped
-        if needOverride then
-            hum.WalkSpeed = nostun_walkout
-        end
-
-        -- (kept for the diagnostic capture line below)
-        local stunBV, hasFling = nil, false
-
-        if capturing and tick() - nostun_lastPrint > 0.1 then
-            nostun_lastPrint = tick()
-            local movers = {}
-            for _, c in ipairs(char:GetDescendants()) do
-                if c:IsA("BodyMover") or c:IsA("Constraint") then
-                    local extra = ""
-                    if c:IsA("BodyVelocity") then extra = " v=" .. tostring(c.Velocity) .. " mf=" .. tostring(c.MaxForce) end
-                    if c:IsA("BodyPosition") then extra = " p=" .. tostring(c.Position) .. " mf=" .. tostring(c.MaxForce) end
-                    if c:IsA("AlignPosition") then extra = " att0=" .. tostring(c.Attachment0) .. " att1=" .. tostring(c.Attachment1) end
-                    movers[#movers+1] = string.format("%s/%s%s", (c.Parent and c.Parent.Name or "?"), c.ClassName, extra)
+        -- Bail if any knockback/fling BV is active — let the game's push play.
+        for _, d in ipairs(hrp:GetDescendants()) do
+            if d:IsA("BodyVelocity") then
+                local pn = d.Parent and d.Parent.Name or ""
+                if pn == "StunBV" or pn == "UpFling" or pn == "DownerFling"
+                    or d.Name == "StunBV" or d.Name == "UpFling" or d.Name == "DownerFling" then
+                    return
                 end
             end
-            local vel = hrp and hrp.AssemblyLinearVelocity or V3(0,0,0)
-            local md  = hum.MoveDirection
-            local tagAge = lastTag > 0 and (tick() - lastTag) or 999
-            local line = string.format("[NS] EN=%s tagAge=%.2f wsCap=%s sBV=%s fling=%s OVR=%s | iC=%s WS=%.1f JP=%.1f vel=(%.1f,%.1f,%.1f) MD=(%.2f,%.2f,%.2f) movers=[%s]",
-                tostring(nostun_enabled), tagAge, tostring(wsCapped), tostring(stunBV ~= nil), tostring(hasFling), tostring(needOverride),
-                tostring(nostun_inCombo), hum.WalkSpeed, hum.JumpPower,
-                vel.X, vel.Y, vel.Z, md.X, md.Y, md.Z, table.concat(movers, " | "))
-            if nostun_capBuf then nostun_capBuf[#nostun_capBuf+1] = line end
         end
 
-        if not capturing and nostun_capBuf then
-            local buf = nostun_capBuf
-            nostun_capBuf = nil
-            local txt = table.concat(buf, "\n")
-            local copyFn = rawget(getfenv(), "setclipboard")
-                or rawget(getfenv(), "toclipboard")
-                or rawget(getfenv(), "set_clipboard")
-                or (Clipboard and Clipboard.set)
-            local copied = false
-            if copyFn then copied = pcall(copyFn, txt) end
-            print(string.format("\n========== NS CAPTURE (%d lines, clipboard=%s) ==========\n%s\n========== END ==========",
-                #buf, tostring(copied), txt))
-        end
+        -- Throw-inertia bail: if we're already moving faster horizontally than
+        -- walkout * 1.4, we're being thrown / sliding under inertia from a
+        -- combo finisher — don't clamp it. Squared compare avoids a sqrt.
+        local cur = hrp.AssemblyLinearVelocity
+        local thresh = nostun_walkout * 1.4
+        if (cur.X * cur.X + cur.Z * cur.Z) > (thresh * thresh) then return end
+
+        -- Read WASD directly (PlayerModule input is suppressed during stun).
+        local x, z = 0, 0
+        if UIS:IsKeyDown(Enum.KeyCode.W) then z = z - 1 end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then z = z + 1 end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then x = x - 1 end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then x = x + 1 end
+        if x == 0 and z == 0 then return end
+
+        local cf  = Camera.CFrame
+        local fwd = V3(cf.LookVector.X, 0, cf.LookVector.Z)
+        if fwd.Magnitude < 0.001 then return end
+        local rgt = V3(cf.RightVector.X, 0, cf.RightVector.Z)
+        local dir = (rgt.Unit * x + fwd.Unit * (-z)).Unit
+        hrp.AssemblyLinearVelocity = V3(dir.X * nostun_walkout, cur.Y, dir.Z * nostun_walkout)
     end)
-
-    Toggles.LegitNoStunTgl:OnChanged(function()
-        nostun_enabled = Toggles.LegitNoStunTgl.Value
-    end)
-
-    Options.LegitWalkoutSpeed:OnChanged(function()
-        nostun_walkout = Options.LegitWalkoutSpeed.Value
-    end)
-
-    -- Server-spawned BodyMovers (StunBV/UpFling/DownerFling/etc) are network-
-    -- authoritative during stun, so modifying them client-side gets reverted.
-    -- Instead we track when one is active on the character and, while active,
-    -- override AssemblyLinearVelocity each frame to your input direction at
-    -- the walk-out speed. The stun mover still "exists" server-side (looks legit)
-    -- but locally you drift in your input direction.
-    -- NOSTUN_MOVER_NAMES, nostun_knockMul, nostun_activeStuns declared above (must precede BindToRenderStep closure)
-
-    -- (counter-based tracking was unreliable — server-spawned BVs can be
-    -- destroyed without DescendantRemoving firing in our handler.) We now
-    -- recompute nostun_activeStuns each frame in the render-step block via a
-    -- lightweight descendant scan.
 
 
     -- Exploits: Characters 1
