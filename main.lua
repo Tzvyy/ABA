@@ -617,11 +617,106 @@
         Default = false,
         Tooltip = "When an enemy M1 hits your block, instantly trade with an M1 back.",
     })
-    local autotrade_enabled = false
-    local autotrade_lastAt  = 0
+    CombatGroup:AddSlider("AutoTradeComboGap", {
+        Text = "Combo Gap Threshold",
+        Default = 0.45, Min = 0.20, Max = 0.80, Rounding = 2,
+        Increment = 0.05, Suffix = "s",
+        Tooltip = "If two enemy M1 anims arrive within this gap, treat it as a held combo and delay the trade until hit #2 lands. Larger = more aggressive combo detection.",
+    })
+    local autotrade_enabled    = false
+    local autotrade_lastAt     = 0      -- last time a trade actually fired (cooldown)
+    local autotrade_lastAnimAt = 0      -- last time any enemy M1 anim arrived
+    local autotrade_pendingTok = 0      -- token used to cancel scheduled trades
+    local autotrade_running    = false  -- a trade sequence is currently executing
+    local autotrade_comboGap   = 0.45
+    -- Pre-declared because runTrade (defined below) closes over them. The
+    -- AutoBlock UI block lower down only assigns to these via OnChanged.
+    local autoblock_enabled    = false
+    local autoblock_range      = 12
+    local autoblock_holding    = false
+    local autoblock_raiseTok   = 0      -- bumped on every eager BlockOn; watchdog uses this to cancel
     Toggles.AutoTradeTgl:OnChanged(function()
         autotrade_enabled = Toggles.AutoTradeTgl.Value
     end)
+    Options.AutoTradeComboGap:OnChanged(function()
+        autotrade_comboGap = Options.AutoTradeComboGap.Value
+    end)
+
+    -- Resolve the Input remote (Backpack/Input) used for BlockOn/BlockOff/M1.
+    -- Backpack is rebuilt on respawn so we re-resolve after CharacterAdded.
+    local inputRemote
+    local function refreshInputRemote()
+        local bp = LP:FindFirstChildOfClass("Backpack")
+        inputRemote = bp and bp:FindFirstChild("Input")
+    end
+    refreshInputRemote()
+    LP.CharacterAdded:Connect(function() task.delay(0.5, refreshInputRemote) end)
+
+    -- Core trade sequence. Returns immediately if the script unloaded or the
+    -- character is gone. `needRaise` means we should manage block ourselves
+    -- (auto-block path); otherwise the user is holding F.
+    -- Eager BlockOn with self-cancelling watchdog: forces BlockOff after
+    -- AUTOBLOCK_MAX_HOLD if no trade consumes it (cancelled schedule, toggle
+    -- flipped off, finisher arrived, etc). Prevents stuck-block.
+    local AUTOBLOCK_MAX_HOLD = 0.8
+    local function eagerBlockOn()
+        if not inputRemote then refreshInputRemote() end
+        if not inputRemote then return end
+        inputRemote:FireServer("BlockOn")
+        autoblock_holding   = true
+        autoblock_raiseTok  = autoblock_raiseTok + 1
+        local myTok = autoblock_raiseTok
+        task.delay(AUTOBLOCK_MAX_HOLD, function()
+            if myTok ~= autoblock_raiseTok then return end -- superseded
+            if autotrade_running then return end           -- trade is managing it
+            if UIS:IsKeyDown(Enum.KeyCode.F) then return end -- user holding manual block
+            if inputRemote then inputRemote:FireServer("BlockOff") end
+            autoblock_holding = false
+        end)
+    end
+
+    local function runTrade(needRaise, myCharSnap)
+        autotrade_lastAt   = tick()
+        autotrade_running  = true
+        autoblock_holding  = needRaise
+        autoblock_raiseTok = autoblock_raiseTok + 1 -- invalidate pre-trade watchdogs
+        task.spawn(function()
+            if not inputRemote then refreshInputRemote() end
+            local function bail()
+                autotrade_running = false
+                autoblock_holding = false
+            end
+            if not inputRemote then return bail() end
+            if not (myCharSnap and myCharSnap.Parent) then return bail() end
+
+            if needRaise then
+                inputRemote:FireServer("BlockOn")
+            end
+            -- Wait for the enemy's M1 to land on block.
+            task.wait(0.15)
+            if not myCharSnap.Parent then return bail() end
+
+            local h2  = myCharSnap:FindFirstChildOfClass("Humanoid")
+            local air = h2 and (h2:GetState() == Enum.HumanoidStateType.Freefall) or false
+            inputRemote:FireServer("BlockOff")
+            task.wait(0.02)
+            inputRemote:FireServer("M1", {
+                air = air,
+                skeyreal = false,
+                skeydown = true,
+                mousehit = Camera.CFrame,
+                md = h2 and h2.MoveDirection or V3(0, 0, 0),
+            })
+            -- Re-raise block ONLY if the user is still manually holding F.
+            -- In auto-block-only mode we leave block down: the next enemy M1
+            -- anim re-triggers the eager BlockOn naturally.
+            if UIS:IsKeyDown(Enum.KeyCode.F) then
+                inputRemote:FireServer("BlockOn")
+            end
+            autotrade_running = false
+            autoblock_holding = false
+        end)
+    end
 
     -- Auto Block lives inside a DependencyBox gated on Auto M1 Trade.
     local AutoBlockDep = CombatGroup:AddDependencyBox()
@@ -636,10 +731,6 @@
     })
     AutoBlockDep:SetupDependencies({ { Toggles.AutoTradeTgl, true } })
 
-    local autoblock_enabled = false
-    local autoblock_range   = 12
-    local autoblock_lastAt  = 0
-    local autoblock_holding = false
     Toggles.AutoBlockTgl:OnChanged(function()
         autoblock_enabled = Toggles.AutoBlockTgl.Value
     end)
@@ -652,24 +743,21 @@
     -- which BREAKS block — we exclude it from auto-block but allow auto-trade
     -- to still respond if the user is already manually blocking.
     local ENEMY_M1_ANIM_IDS = {
+        -- Fists
         ["rbxassetid://1461128166"] = true,
         ["rbxassetid://1461128859"] = true,
         ["rbxassetid://1461136273"] = true,
         ["rbxassetid://1461136875"] = true,
+        -- Sword
+        ["rbxassetid://1470422387"] = true,
+        ["rbxassetid://1470439852"] = true,
+        ["rbxassetid://1470449816"] = true,
+        ["rbxassetid://1470447472"] = true,
     }
     local ENEMY_M1_FINISHER_IDS = {
-        ["rbxassetid://1461137417"] = true,
+        ["rbxassetid://1461137417"] = true, -- Fists finisher
+        ["rbxassetid://1470454728"] = true, -- Sword finisher
     }
-
-    -- Resolve the Input remote (Backpack/Input) used for BlockOn/BlockOff/M1.
-    -- Backpack is rebuilt on respawn so we re-resolve after CharacterAdded.
-    local inputRemote
-    local function refreshInputRemote()
-        local bp = LP:FindFirstChildOfClass("Backpack")
-        inputRemote = bp and bp:FindFirstChild("Input")
-    end
-    refreshInputRemote()
-    LP.CharacterAdded:Connect(function() task.delay(0.5, refreshInputRemote) end)
 
     -- Standing Downslam — toggle gate + Hold-only keybind. While the toggle is
     -- on, every press of the bound key fires an air-M1 once.
@@ -686,28 +774,11 @@
         })
     end
 
-    local downslamToggle = CombatGroup:AddToggle("DownslamM1Tgl", {
+    CombatGroup:AddHotkey("DownslamM1Hotkey", {
         Text = "Standing Downslam",
-        Default = false,
-        Tooltip = "While on, the bound key fires an air-M1 (Standing Downslam) once per press.",
+        Default = "None",
+        Callback = function() fireDownslam() end,
     })
-    downslamToggle:AddKeyPicker("DownslamM1Key", {
-        Default = "J",
-        Mode = "Hold",
-        Modes = { "Hold" },
-        Text = "Downslam Key",
-        SyncToggleState = false,
-        NoUI = false,
-    })
-    local downslamKey = Options.DownslamM1Key or Toggles.DownslamM1Key
-    if downslamKey and downslamKey.OnClick then
-        downslamKey:OnClick(function()
-            if not Toggles.DownslamM1Tgl.Value then return end
-            fireDownslam()
-        end)
-    else
-        warn("[ABP] DownslamM1Key keypicker not found in Options/Toggles")
-    end
 
     -- Animation discovery — logs animations played on every other player for 10s.
     CombatGroup:AddButton({
@@ -740,70 +811,107 @@
                             tostring(id), tostring(anim.Name), tostring(track.Length))
                     end
 
-                    -- Live trigger: only on real M1 anims.
+                    -- Live trigger: only on real M1 anims (or finishers, which
+                    -- only act to cancel pending trades — never trigger one).
                     local isM1       = ENEMY_M1_ANIM_IDS[id]
                     local isFinisher = ENEMY_M1_FINISHER_IDS[id]
                     if not (isM1 or isFinisher) then return end
-                    if not (autotrade_enabled or autoblock_enabled) then return end
+                    if not autotrade_enabled then return end
 
                     local myChar = LP.Character
                     local myHrp  = myChar and myChar:FindFirstChild("HumanoidRootPart")
                     local enHrp  = char:FindFirstChild("HumanoidRootPart")
                     if not (myHrp and enHrp) then return end
 
-                    -- Range gate (both features share the autoblock_range).
-                    local dist = (enHrp.Position - myHrp.Position).Magnitude
-                    if dist > autoblock_range then return end
-
                     -- Self-cast guard: never act if we're mid-skill.
                     if myChar:FindFirstChild("Action") then return end
 
-                    local fDown = UIS:IsKeyDown(Enum.KeyCode.F)
-                    local now   = tick()
+                    -- Finisher: cancel any pending schedule and bail (regardless
+                    -- of range — finishers are dangerous if they close in).
+                    if isFinisher then
+                        autotrade_pendingTok = autotrade_pendingTok + 1
+                        return
+                    end
 
-                    -- Only act on real M1 hits, and only if cooldown passed.
-                    if not isM1 then return end
-                    if (now - autotrade_lastAt) <= 0.6 then return end
-                    if autoblock_holding then return end -- already in sequence
+                    -- In-range body. Closes over `myChar` and `char`; called
+                    -- either immediately (anim fired in range) or by the dash
+                    -- watcher (enemy closed in mid-anim). `immediate=true` skips
+                    -- the combo-gap wait — used by the dash watcher because the
+                    -- enemy's hit is landing right now.
+                    local function armTrade(immediate)
+                        local fDown = UIS:IsKeyDown(Enum.KeyCode.F)
+                        local now   = tick()
 
-                    -- Decide if we can engage: either user is blocking, or
-                    -- Auto Block is on (we'll raise block ourselves).
-                    local needRaise = (not fDown) and autoblock_enabled
-                    local canTrade  = autotrade_enabled and (fDown or needRaise)
-                    if not canTrade then return end
+                        -- Decide engagement: manual block or auto-block.
+                        local needRaise = (not fDown) and autoblock_enabled
+                        if not (fDown or needRaise) then return end
 
-                    autotrade_lastAt  = now
-                    autoblock_holding = needRaise -- mark so other anims don't double-fire
-                    task.spawn(function()
-                        if not inputRemote then refreshInputRemote() end
-                        if not inputRemote then autoblock_holding = false; return end
-
-                        -- Raise block first if user wasn't already holding F.
-                        if needRaise then
-                            inputRemote:FireServer("BlockOn")
+                        -- ALWAYS raise block first if Auto Block is on, even
+                        -- during trade cooldown. Eager BlockOn carries its own
+                        -- watchdog timer to prevent stuck-block.
+                        if needRaise and not autotrade_running then
+                            eagerBlockOn()
                         end
 
-                        -- Wait for impact to land on block.
-                        task.wait(0.25)
-
-                        local h2  = myChar:FindFirstChildOfClass("Humanoid")
-                        local air = h2 and (h2:GetState() == Enum.HumanoidStateType.Freefall) or false
-                        inputRemote:FireServer("BlockOff")
-                        task.wait(0.05)
-                        inputRemote:FireServer("M1", {
-                            air = air,
-                            skeyreal = false,
-                            skeydown = true,
-                            mousehit = Camera.CFrame,
-                            md = h2 and h2.MoveDirection or V3(0, 0, 0),
-                        })
-
-                        -- Re-raise block if user is still holding F (manual block).
-                        if UIS:IsKeyDown(Enum.KeyCode.F) then
-                            inputRemote:FireServer("BlockOn")
+                        -- Cooldown gate (set when a trade actually fires).
+                        if (now - autotrade_lastAt) <= 0.6 then
+                            autotrade_lastAnimAt = now
+                            return
                         end
-                        autoblock_holding = false
-                    end)
+                        -- Already executing a trade.
+                        if autotrade_running then
+                            autotrade_lastAnimAt = now
+                            return
+                        end
+
+                        local gap = now - autotrade_lastAnimAt
+                        autotrade_lastAnimAt = now
+
+                        if immediate or (gap <= autotrade_comboGap and autotrade_pendingTok > 0) then
+                            -- Combo confirmed OR dash close-in: fire trade now.
+                            autotrade_pendingTok = autotrade_pendingTok + 1
+                            runTrade(needRaise, myChar)
+                        else
+                            autotrade_pendingTok = autotrade_pendingTok + 1
+                            local myTok = autotrade_pendingTok
+                            local snapChar = myChar
+                            local snapNeedRaise = needRaise
+                            task.delay(autotrade_comboGap + 0.05, function()
+                                if myTok ~= autotrade_pendingTok then return end
+                                if not autotrade_enabled then return end
+                                if (tick() - autotrade_lastAt) <= 0.6 then return end
+                                runTrade(snapNeedRaise, snapChar)
+                            end)
+                        end
+                    end
+
+                    local dist = (enHrp.Position - myHrp.Position).Magnitude
+                    if dist <= autoblock_range then
+                        armTrade()
+                    elseif dist <= math.min(autoblock_range * 2.5, 35) then
+                        -- Dash case: enemy started M1 outside range but might
+                        -- close in. Raise block IMMEDIATELY (the watchdog will
+                        -- drop it if no hit lands) so dashers can't out-speed
+                        -- the watcher. Then poll for cross-in to fire the trade.
+                        if (not UIS:IsKeyDown(Enum.KeyCode.F))
+                            and autoblock_enabled and not autotrade_running then
+                            eagerBlockOn()
+                        end
+                        local deadline = tick() + autotrade_comboGap + 0.1
+                        local conn
+                        conn = RunService.Heartbeat:Connect(function()
+                            if tick() >= deadline
+                                or not (myChar and myChar.Parent and char.Parent) then
+                                conn:Disconnect(); return
+                            end
+                            local h1 = myChar:FindFirstChild("HumanoidRootPart")
+                            local h2 = char:FindFirstChild("HumanoidRootPart")
+                            if h1 and h2 and (h2.Position - h1.Position).Magnitude <= autoblock_range then
+                                conn:Disconnect()
+                                armTrade(true) -- immediate: hit is landing now
+                            end
+                        end)
+                    end
                 end)
             end)
         end
