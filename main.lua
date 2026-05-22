@@ -692,11 +692,12 @@
     trackActionFolder(LP.Character)
     LP.CharacterAdded:Connect(trackActionFolder)
 
-    do
+    task.spawn(function()
         local RS = game:GetService("ReplicatedStorage")
-        local TS = RS:FindFirstChild("TagSystem2")
-        local TR = TS and TS:FindFirstChild("TagReplicate")
+        local TS = RS:WaitForChild("TagSystem2", 30)
+        local TR = TS and TS:WaitForChild("TagReplicate", 30)
         if TR and TR:IsA("RemoteEvent") then
+            print("[NS] TagReplicate listener connected.")
             TR.OnClientEvent:Connect(function(payload, target)
                 local myChar = LP.Character
                 if target ~= myChar then return end
@@ -720,8 +721,10 @@
                     end
                 end
             end)
+        else
+            print("[NS] TagReplicate not found (TagSystem2 missing).")
         end
-    end
+    end)
 
     -- Remote discovery: connect to every RemoteEvent in ReplicatedStorage and
     -- log when one fires server->client. Press "Discover Hit Remote 10s" then
@@ -833,21 +836,20 @@
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         if not (char and hum and hum.Health > 0) then return end
 
-        -- Trigger: ALL three conditions required —
-        --   1. TagReplicate with an enemy-attributed stun tag fired in the last 0.6s.
-        --   2. WalkSpeed is exactly 0 (Action lock) or 5 (creator-tag lock).
-        --      Any other low WS (slows, debuffs) is the game's intent — leave it.
-        --   3. Legit No-Stun toggle is on.
-        -- The override is now WS/JP floor ONLY: we do NOT touch velocity, so the
-        -- game's knockback BV plays out exactly as intended.
+        -- Trigger: enemy-attributed stun tag fired recently AND WalkSpeed is
+        -- exactly 5 (the M1/light-skill slow-walk lock). WS==0 (grabs/animation
+        -- locks) is intentionally NOT touched — those should stay fully locked.
+        -- We do NOT touch knockback BVs, JumpPower, or velocity. Just raise WS.
         local lastTag  = _G.__ns_lastTagAt or 0
         local taggedRecently = (tick() - lastTag) < 0.6
-        local wsCapped = (hum.WalkSpeed == 0) or (hum.WalkSpeed == 5)
+        local wsCapped = (hum.WalkSpeed == 5)
         local needOverride = nostun_enabled and taggedRecently and wsCapped
         if needOverride then
-            if hum.WalkSpeed < nostun_walkout then hum.WalkSpeed = nostun_walkout end
-            if hum.JumpPower < 35 then hum.JumpPower = 35 end
+            hum.WalkSpeed = nostun_walkout
         end
+
+        -- (kept for the diagnostic capture line below)
+        local stunBV, hasFling = nil, false
 
         if capturing and tick() - nostun_lastPrint > 0.1 then
             nostun_lastPrint = tick()
@@ -863,8 +865,10 @@
             end
             local vel = hrp and hrp.AssemblyLinearVelocity or V3(0,0,0)
             local md  = hum.MoveDirection
-            local line = string.format("[NS] iC=%s WS=%.1f JP=%.1f PS=%s vel=(%.1f,%.1f,%.1f) MD=(%.2f,%.2f,%.2f) movers=[%s]",
-                tostring(nostun_inCombo), hum.WalkSpeed, hum.JumpPower, tostring(hum.PlatformStand),
+            local tagAge = lastTag > 0 and (tick() - lastTag) or 999
+            local line = string.format("[NS] EN=%s tagAge=%.2f wsCap=%s sBV=%s fling=%s OVR=%s | iC=%s WS=%.1f JP=%.1f vel=(%.1f,%.1f,%.1f) MD=(%.2f,%.2f,%.2f) movers=[%s]",
+                tostring(nostun_enabled), tagAge, tostring(wsCapped), tostring(stunBV ~= nil), tostring(hasFling), tostring(needOverride),
+                tostring(nostun_inCombo), hum.WalkSpeed, hum.JumpPower,
                 vel.X, vel.Y, vel.Z, md.X, md.Y, md.Z, table.concat(movers, " | "))
             if nostun_capBuf then nostun_capBuf[#nostun_capBuf+1] = line end
         end
