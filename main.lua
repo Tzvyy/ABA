@@ -628,6 +628,8 @@
     local autotrade_lastAnimAt = 0      -- last time any enemy M1 anim arrived
     local autotrade_pendingTok = 0      -- token used to cancel scheduled trades
     local autotrade_running    = false  -- a trade sequence is currently executing
+    local autotrade_animsSinceTrade = 0 -- enemy M1 anims observed since last trade fired
+    local autotrade_hitsSinceTrade  = 0 -- enemy hits registered (TagReplicate) since last trade
     local autotrade_comboGap   = 0.45
     -- Pre-declared because runTrade (defined below) closes over them. The
     -- AutoBlock UI block lower down only assigns to these via OnChanged.
@@ -658,28 +660,51 @@
     -- Eager BlockOn with self-cancelling watchdog: forces BlockOff after
     -- AUTOBLOCK_MAX_HOLD if no trade consumes it (cancelled schedule, toggle
     -- flipped off, finisher arrived, etc). Prevents stuck-block.
-    local AUTOBLOCK_MAX_HOLD = 0.8
-    local function eagerBlockOn()
+    local AUTOBLOCK_MAX_HOLD     = 0.8  -- per-raise watchdog timeout
+    local AUTOBLOCK_ABSOLUTE_MAX = 1.5  -- absolute ceiling: drop block this long after FIRST raise no matter what
+    local autoblock_firstRaiseAt = 0
+    local function eagerBlockOn(shortHold)
         if not inputRemote then refreshInputRemote() end
         if not inputRemote then return end
         inputRemote:FireServer("BlockOn")
+        local wasUp = autoblock_holding
         autoblock_holding   = true
         autoblock_raiseTok  = autoblock_raiseTok + 1
         local myTok = autoblock_raiseTok
-        task.delay(AUTOBLOCK_MAX_HOLD, function()
+        if not wasUp then autoblock_firstRaiseAt = tick() end
+        local firstRaise = autoblock_firstRaiseAt
+        local hold = shortHold or AUTOBLOCK_MAX_HOLD
+        -- Per-raise watchdog: drops block if no further raises within hold.
+        task.delay(hold, function()
             if myTok ~= autoblock_raiseTok then return end -- superseded
-            if autotrade_running then return end           -- trade is managing it
-            if UIS:IsKeyDown(Enum.KeyCode.F) then return end -- user holding manual block
+            if autotrade_running then return end
+            if UIS:IsKeyDown(Enum.KeyCode.F) then return end
             if inputRemote then inputRemote:FireServer("BlockOff") end
             autoblock_holding = false
         end)
+        -- Absolute-ceiling watchdog: even if anim spam keeps superseding the
+        -- per-raise timer, force-drop block at firstRaise + ABSOLUTE_MAX.
+        if not wasUp then
+            task.delay(AUTOBLOCK_ABSOLUTE_MAX, function()
+                if autoblock_firstRaiseAt ~= firstRaise then return end -- new sequence started
+                if autotrade_running then return end
+                if UIS:IsKeyDown(Enum.KeyCode.F) then return end
+                if inputRemote then inputRemote:FireServer("BlockOff") end
+                autoblock_holding = false
+            end)
+        end
     end
 
-    local function runTrade(needRaise, myCharSnap)
+    local function runTrade(needRaise, myCharSnap, preImpactWait, postBlockOffWait)
         autotrade_lastAt   = tick()
         autotrade_running  = true
         autoblock_holding  = needRaise
         autoblock_raiseTok = autoblock_raiseTok + 1 -- invalidate pre-trade watchdogs
+        autotrade_animsSinceTrade = 0
+        autotrade_hitsSinceTrade  = 0
+        autoblock_firstRaiseAt    = 0  -- next eagerBlockOn starts a fresh sequence
+        local wait1 = preImpactWait or 0.15
+        local wait2 = postBlockOffWait or 0.02
         task.spawn(function()
             if not inputRemote then refreshInputRemote() end
             local function bail()
@@ -693,13 +718,13 @@
                 inputRemote:FireServer("BlockOn")
             end
             -- Wait for the enemy's M1 to land on block.
-            task.wait(0.15)
+            if wait1 > 0 then task.wait(wait1) end
             if not myCharSnap.Parent then return bail() end
 
             local h2  = myCharSnap:FindFirstChildOfClass("Humanoid")
             local air = h2 and (h2:GetState() == Enum.HumanoidStateType.Freefall) or false
             inputRemote:FireServer("BlockOff")
-            task.wait(0.02)
+            if wait2 > 0 then task.wait(wait2) end
             inputRemote:FireServer("M1", {
                 air = air,
                 skeyreal = false,
@@ -833,44 +858,80 @@
                         return
                     end
 
-                    -- In-range body. Closes over `myChar` and `char`; called
-                    -- either immediately (anim fired in range) or by the dash
-                    -- watcher (enemy closed in mid-anim). `immediate=true` skips
-                    -- the combo-gap wait — used by the dash watcher because the
-                    -- enemy's hit is landing right now.
-                    local function armTrade(immediate)
-                        local fDown = UIS:IsKeyDown(Enum.KeyCode.F)
-                        local now   = tick()
+                    -- Track anim arrival regardless of range so combo detection
+                    -- works even when the enemy is dash-spamming from outside.
+                    autotrade_animsSinceTrade = autotrade_animsSinceTrade + 1
+                    autotrade_lastAnimAt = tick()
 
-                        -- Decide engagement: manual block or auto-block.
+                    -- Block-arming: only raise block when enemy is actually
+                    -- in range. Out-of-range anims don't auto-block (dash
+                    -- watcher below handles cross-in). Suppressed briefly
+                    -- after a trade so we don't re-block immediately after
+                    -- our M1.
+                    local dist = (enHrp.Position - myHrp.Position).Magnitude
+                    local armRadius = math.min(autoblock_range * 2.5, 35)
+                    local POST_TRADE_BLOCK_LOCKOUT = 0.6
+                    local postTradeQuiet = (tick() - autotrade_lastAt) > POST_TRADE_BLOCK_LOCKOUT
+                    -- Closing-speed helper: returns true if enemy is moving
+                    -- toward us fast enough to be a dash threat.
+                    local function isClosingFast(eh, mh)
+                        if not (eh and mh) then return false end
+                        local toMe = mh.Position - eh.Position
+                        local toMeFlat = V3(toMe.X, 0, toMe.Z)
+                        local mag = toMeFlat.Magnitude
+                        if mag <= 0.1 then return false end
+                        local v = eh.AssemblyLinearVelocity
+                        local vFlat = V3(v.X, 0, v.Z)
+                        return vFlat:Dot(toMeFlat / mag) > 12 -- studs/sec
+                    end
+
+                    if postTradeQuiet
+                        and (not UIS:IsKeyDown(Enum.KeyCode.F))
+                        and autoblock_enabled and not autotrade_running then
+                        if dist <= autoblock_range then
+                            eagerBlockOn()
+                        elseif dist <= armRadius and isClosingFast(enHrp, myHrp) then
+                            eagerBlockOn(0.4)
+                        elseif dist <= armRadius then
+                            -- Velocity not yet replicated: poll for a few
+                            -- frames and raise block as soon as the closing
+                            -- speed crosses the threshold or they cross in.
+                            local snapEn, snapMy = enHrp, myHrp
+                            local deadline = tick() + 0.25
+                            local conn
+                            conn = RunService.Heartbeat:Connect(function()
+                                if tick() >= deadline
+                                    or not (snapEn.Parent and snapMy.Parent)
+                                    or autotrade_running
+                                    or (tick() - autotrade_lastAt) <= POST_TRADE_BLOCK_LOCKOUT then
+                                    conn:Disconnect(); return
+                                end
+                                local d = (snapEn.Position - snapMy.Position).Magnitude
+                                if d <= autoblock_range or isClosingFast(snapEn, snapMy) then
+                                    conn:Disconnect()
+                                    eagerBlockOn(0.4)
+                                end
+                            end)
+                        end
+                    end
+
+                    -- Trade decision (anim-based fallback in case TagReplicate
+                    -- doesn't fire for blocked hits). Combo-aware: 1st hit
+                    -- defers; 2nd hit within combo gap fires immediately.
+                    local function armTrade()
+                        local fDown = UIS:IsKeyDown(Enum.KeyCode.F)
                         local needRaise = (not fDown) and autoblock_enabled
                         if not (fDown or needRaise) then return end
-
-                        -- ALWAYS raise block first if Auto Block is on, even
-                        -- during trade cooldown. Eager BlockOn carries its own
-                        -- watchdog timer to prevent stuck-block.
-                        if needRaise and not autotrade_running then
-                            eagerBlockOn()
-                        end
-
-                        -- Cooldown gate (set when a trade actually fires).
-                        if (now - autotrade_lastAt) <= 0.6 then
-                            autotrade_lastAnimAt = now
-                            return
-                        end
-                        -- Already executing a trade.
-                        if autotrade_running then
-                            autotrade_lastAnimAt = now
-                            return
-                        end
-
-                        local gap = now - autotrade_lastAnimAt
-                        autotrade_lastAnimAt = now
-
-                        if immediate or (gap <= autotrade_comboGap and autotrade_pendingTok > 0) then
-                            -- Combo confirmed OR dash close-in: fire trade now.
+                        if (tick() - autotrade_lastAt) <= 0.6 then return end
+                        if autotrade_running then return end
+                        local count = autotrade_animsSinceTrade
+                        if count >= 2 then
+                            -- Combo confirmed at hit #2's anim. Hit #2's
+                            -- impact lands ~0.25s after the anim, so we
+                            -- need a longer pre-impact wait here so block
+                            -- stays up through hit #2 before BlockOff+M1.
                             autotrade_pendingTok = autotrade_pendingTok + 1
-                            runTrade(needRaise, myChar)
+                            runTrade(needRaise, myChar, 0.25, 0.015)
                         else
                             autotrade_pendingTok = autotrade_pendingTok + 1
                             local myTok = autotrade_pendingTok
@@ -879,24 +940,18 @@
                             task.delay(autotrade_comboGap + 0.05, function()
                                 if myTok ~= autotrade_pendingTok then return end
                                 if not autotrade_enabled then return end
+                                if autotrade_running then return end
                                 if (tick() - autotrade_lastAt) <= 0.6 then return end
                                 runTrade(snapNeedRaise, snapChar)
                             end)
                         end
                     end
-
-                    local dist = (enHrp.Position - myHrp.Position).Magnitude
                     if dist <= autoblock_range then
                         armTrade()
-                    elseif dist <= math.min(autoblock_range * 2.5, 35) then
-                        -- Dash case: enemy started M1 outside range but might
-                        -- close in. Raise block IMMEDIATELY (the watchdog will
-                        -- drop it if no hit lands) so dashers can't out-speed
-                        -- the watcher. Then poll for cross-in to fire the trade.
-                        if (not UIS:IsKeyDown(Enum.KeyCode.F))
-                            and autoblock_enabled and not autotrade_running then
-                            eagerBlockOn()
-                        end
+                    elseif dist <= armRadius then
+                        -- Dash: poll for cross-in. On cross-in, raise block
+                        -- and arm trade. Block is NOT raised pre-emptively
+                        -- so out-of-range anims don't waste it.
                         local deadline = tick() + autotrade_comboGap + 0.1
                         local conn
                         conn = RunService.Heartbeat:Connect(function()
@@ -908,7 +963,12 @@
                             local h2 = char:FindFirstChild("HumanoidRootPart")
                             if h1 and h2 and (h2.Position - h1.Position).Magnitude <= autoblock_range then
                                 conn:Disconnect()
-                                armTrade(true) -- immediate: hit is landing now
+                                if (not UIS:IsKeyDown(Enum.KeyCode.F))
+                                    and autoblock_enabled and not autotrade_running
+                                    and (tick() - autotrade_lastAt) > POST_TRADE_BLOCK_LOCKOUT then
+                                    eagerBlockOn()
+                                end
+                                armTrade()
                             end
                         end)
                     end
@@ -1011,6 +1071,45 @@
                         -- No-stun trigger (skip if it's our own cast).
                         if not actionStale then
                             nostun_lastTagAt = tick()
+                        end
+
+                        -- ============================================================
+                        -- AUTO TRADE — event-driven trigger. ABA fires this the
+                        -- exact moment a hit lands on us (blocked or not), so we
+                        -- can M1 back without any impact-time guessing.
+                        -- ============================================================
+                        if autotrade_enabled
+                            and not autotrade_running
+                            and not actionStale
+                            and (tick() - autotrade_lastAt) > 0.6 then
+                            local fDown = UIS:IsKeyDown(Enum.KeyCode.F)
+                            local needRaise = (not fDown) and autoblock_enabled
+                            -- Only trade if we were actually blocking (manual F
+                            -- or auto-block currently holding via eagerBlockOn).
+                            if fDown or (needRaise and autoblock_holding) then
+                                autotrade_hitsSinceTrade = autotrade_hitsSinceTrade + 1
+                                if autotrade_hitsSinceTrade >= 2 then
+                                    -- Combo: blocked 2+ hits, fire trade now.
+                                    -- Block stayed up the whole time.
+                                    autotrade_pendingTok = autotrade_pendingTok + 1
+                                    runTrade(needRaise, myChar, 0, 0.015)
+                                else
+                                    -- Single hit so far: schedule deferred trade.
+                                    -- If a 2nd hit arrives within combo gap, the
+                                    -- combo branch above pre-empts this schedule.
+                                    autotrade_pendingTok = autotrade_pendingTok + 1
+                                    local myTok        = autotrade_pendingTok
+                                    local snapChar     = myChar
+                                    local snapNeedRaise = needRaise
+                                    task.delay(autotrade_comboGap + 0.05, function()
+                                        if myTok ~= autotrade_pendingTok then return end
+                                        if not autotrade_enabled then return end
+                                        if autotrade_running then return end
+                                        if (tick() - autotrade_lastAt) <= 0.6 then return end
+                                        runTrade(snapNeedRaise, snapChar, 0, 0.015)
+                                    end)
+                                end
+                            end
                         end
                         return
                     end
